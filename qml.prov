@@ -1,0 +1,79 @@
+#!/bin/bash
+
+# Compare 2 version numbers -- succeds if
+# parameter 1 is newer than parameter 2
+# e.g.
+#	newer 1.0 2.0		false
+#	newer 2.0 1.0		true
+#	newer 1.0 1.0		false
+#	newer 1.0 ""		true
+#	newer 1.2.3.4 1.2	true
+#	newer 1.10 1.9		true
+newer() {
+	[ "$1" = "$2" ] && return 1
+
+	local IFS=.
+	local i v1=($1) v2=($2)
+
+	for ((i=${#v1[@]}; i<${#v2[@]}; i++)); do
+		v1[i]=0
+	done
+	for ((i=0; i<${#v1[@]}; i++)); do
+		[[ -z ${v2[i]} ]] && v2[i]=0
+		((10#${v1[i]} > 10#${v2[i]})) && return 0
+        	((10#${v1[i]} < 10#${v2[i]})) && return 1
+	done
+	return 1
+}
+
+while read r; do
+	echo $r |grep -qE '^.*/qmldir$' || continue
+	MODULE=""
+	MVER=""
+	while read l; do
+		OPTIONAL=""
+		L="$(echo $l |tr -s '[:blank:]' | sed -e 's/^[[:space:]]*//')"
+		if echo $L |grep -q '^optional '; then
+			L="$(echo $L |sed -e 's,^optional ,,')"
+		fi
+		[ -z "$L" ] && continue
+		if echo $L |grep -qiE '^(#|internal |plugin |classname |typeinfo |depends |designersupported|import |prefer )'; then
+			# None of those are relevant to the Provides: generator...
+			continue
+		elif echo $L |grep -qE '^module '; then
+			# FIXME is there a way to determine the module
+			# version other than looking at the items it
+			# provides? There doesn't seem to be anything
+			# from which to automatically generate
+			# qml(QtQuick) = 2.0 or so...
+			# But the way we generate MVER may be a
+			# good enough guess
+			MODULE="$(echo $L |cut -d' ' -f2-)"
+		elif echo $L |grep -qi '^singleton '; then
+			TYPE="$(echo $L |cut -d' ' -f2)"
+			VER="$(echo $L |cut -d' ' -f3)"
+			if [ "$VER" = "auto" ]; then
+				echo "qml($MODULE.$TYPE)"
+			else
+				newer "$VER" "$MVER" && MVER="$VER"
+				echo "qml($MODULE.$TYPE) = $VER"
+			fi
+		else
+			TYPE="$(echo $L |cut -d' ' -f1)"
+			VER="$(echo $L |cut -d' ' -f2)"
+			if [ "$VER" = "auto" ]; then
+				echo "qml($MODULE.$TYPE)"
+			else
+				newer "$VER" "$MVER" && MVER="$VER"
+				echo "qml($MODULE.$TYPE) = $VER"
+			fi
+		fi
+	done < <(cat $r)
+	if [ -n "$MODULE" ]; then
+		if [ -n "$MVER" ]; then
+			echo "qml($MODULE) = $MVER"
+		else
+			echo "qml($MODULE)"
+		fi
+	fi
+done |sort |uniq
