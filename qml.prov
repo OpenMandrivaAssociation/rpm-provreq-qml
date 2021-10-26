@@ -37,7 +37,7 @@ while read r; do
 			L="$(echo $L |sed -e 's,^optional ,,')"
 		fi
 		[ -z "$L" ] && continue
-		if echo $L |grep -qiE '^(#|internal |plugin |classname |typeinfo |depends |designersupported|import |prefer )'; then
+		if echo $L |grep -qiE '^(#|internal |plugin |classname |typeinfo |depends |designersupported|import |prefer |linktarget )'; then
 			# None of those are relevant to the Provides: generator...
 			continue
 		elif echo $L |grep -qE '^module '; then
