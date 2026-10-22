@@ -1,0 +1,10 @@
+# QML compiled into ELF plugins and executables with rcc, and C++ QML
+# modules registered from those binaries.
+# multifile: one qmldeps process per package. qmldeps returns no deps unless
+# the file embeds QML resources or registers a QML module.
+%__qmlelf_provides	%{_rpmconfigdir}/qmldeps --provides --multifile
+%__qmlelf_requires	%{_rpmconfigdir}/qmldeps --requires --multifile
+%__qmlelf_protocol	multifile
+%__qmlelf_magic		^(setuid,? )?(setgid,? )?(sticky )?ELF (32|64)-bit.*(executable|shared object)
+# One macro: a later %__qmlelf_exclude_path line would replace this one.
+%__qmlelf_exclude_path	^(/usr/lib/debug/|/usr/lib64/debug/|/usr/lib/\\.build-id/|/usr/lib64/\\.build-id/)|(^/lib/modules/.*\\.ko?(\\.[[:alnum:]]*)?$)|(^/usr/lib/modules/.*\\.ko?(\\.[[:alnum:]]*)?$)

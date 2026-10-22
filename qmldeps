@@ -1,0 +1,2332 @@
+#!/usr/bin/python
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""RPM Provides/Requires generator for QML.
+
+Loose .qml and qmldir files are scanned directly. Qt also compiles QML into
+ELF plugins and executables with rcc (qRegisterResourceData), and ships the
+same payload as standalone .rcc blobs. Those copies are zlib- or zstd-compressed
+often enough that they do not show up as plain "import" strings, so the
+generator walks the resource tree instead of scraping strings.
+
+Requires are unversioned qml(Module) names. Import versions are not the
+module version recorded in qmldir (that file usually has none; the generator's
+Provides version is only the highest type version), and a versioned require
+does not match an unversioned provide.
+
+qmldir "depends" and "import" lines are requirements. "optional import" is
+not: the engine does not load it automatically. "default import" only tells
+tooling which optional import to assume.
+
+C++ modules with no qmldir are provided from the registration call
+(qmlRegisterModule, QQmlModuleRegistration, qmlRegisterType,
+qmlProtectModule, ...). The qml_register_types_* symbol alone is not enough:
+Qt turns every non-alphanumeric into '_', so org.kde.kwin_x11 and
+org.kde.kwin.x11 share one symbol. A C string is a provide only when a
+registration call loads it, or when it is the only string that mangles to a
+defined qml_register_types_* symbol. `const char uri[] = "..."` is a stack
+copy of that literal; the bytes are reassembled from the copy.
+
+Directory imports and JavaScript files are not scanned. AOT caches that drop
+the QML source are not scanned.
+
+Set RPM_QML_REQUIRES=0 to emit no requires (provides are unchanged).
+"""
+
+import ctypes
+import os
+import re
+import struct
+import sys
+import zlib
+
+# Must match qresource.cpp / rcc.
+DIRECTORY = 0x02
+COMPRESSED_ZLIB = 0x01
+COMPRESSED_ZSTD = 0x04
+KNOWN_FLAGS = DIRECTORY | COMPRESSED_ZLIB | COMPRESSED_ZSTD
+
+QT_REGISTER = b"_Z21qRegisterResourceDataiPKhS0_S0_"
+ROOT_PREFIX = b"\x00\x00\x00\x00\x00\x02"
+CHILD_OFF_ONE = b"\x00\x00\x00\x01"
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+# rcc writes filenames as uncompressed UTF-16BE. Used to skip ELFs that
+# register resources but do not embed QML (shaders, images, QtGui, ...).
+QMLDIR_UTF16 = "qmldir".encode("utf-16-be")
+DOT_QML_UTF16 = ".qml".encode("utf-16-be")
+# Common zlib CMF/FLG bytes (levels 0, 1, default, 9). The nearby scan accepts
+# any 0x78 flag byte; this list is only the far-blob search.
+ZLIB_MAGICS = (b"\x78\x01", b"\x78\x5e", b"\x78\x9c", b"\x78\xda")
+
+MAX_NODES = 100_000
+MAX_NAME = 4096
+MAX_PAYLOAD = 80_000_000
+DEBUG = os.environ.get("QMLDEPS_DEBUG") == "1"
+
+_ZSTD = None
+
+
+def debug(msg):
+    if DEBUG:
+        print(f"qmldeps: {msg}", file=sys.stderr)
+
+
+def u16(buf, off):
+    if off < 0 or off + 2 > len(buf):
+        return None
+    return int.from_bytes(buf[off:off + 2], "big")
+
+
+def u32(buf, off):
+    if off < 0 or off + 4 > len(buf):
+        return None
+    return int.from_bytes(buf[off:off + 4], "big")
+
+
+def qt_hash(text):
+    """Qt's stable qt_hash(QStringView). The low 28 bits are what rcc stores."""
+    h = 0
+    for ch in text:
+        h = ((h << 4) + ord(ch)) & 0xFFFFFFFF
+        h ^= (h & 0xF0000000) >> 23
+    return h & 0x0FFFFFFF
+
+
+def libzstd():
+    global _ZSTD
+    if _ZSTD is False:
+        return None
+    if _ZSTD is not None:
+        return _ZSTD
+    try:
+        lib = ctypes.CDLL("libzstd.so.1")
+    except OSError:
+        _ZSTD = False
+        return None
+    lib.ZSTD_getFrameContentSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.ZSTD_getFrameContentSize.restype = ctypes.c_ulonglong
+    lib.ZSTD_decompress.argtypes = [
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t
+    ]
+    lib.ZSTD_decompress.restype = ctypes.c_size_t
+    lib.ZSTD_isError.argtypes = [ctypes.c_size_t]
+    lib.ZSTD_isError.restype = ctypes.c_uint
+    lib.ZSTD_decompressBound.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.ZSTD_decompressBound.restype = ctypes.c_size_t
+    _ZSTD = lib
+    return lib
+
+
+def quncompress(payload):
+    """Undo qCompress: 4-byte big-endian uncompressed size, then a zlib stream."""
+    if len(payload) < 6:
+        return None
+    usize = int.from_bytes(payload[:4], "big")
+    if usize > MAX_PAYLOAD:
+        return None
+    try:
+        data = zlib.decompress(payload[4:])
+    except zlib.error:
+        return None
+    if len(data) != usize:
+        return None
+    return data
+
+
+def zstd_decompress(payload):
+    lib = libzstd()
+    if lib is None or not payload:
+        return None
+    src = ctypes.create_string_buffer(payload, len(payload))
+    usize = lib.ZSTD_getFrameContentSize(src, len(payload))
+    # ZSTD_CONTENTSIZE_UNKNOWN / ERROR are (unsigned long long)-1 and -2.
+    if usize >= (1 << 64) - 2 or usize > MAX_PAYLOAD:
+        bound = lib.ZSTD_decompressBound(src, len(payload))
+        if lib.ZSTD_isError(bound) or bound == 0 or bound > MAX_PAYLOAD:
+            return None
+        usize = bound
+    dst = ctypes.create_string_buffer(usize)
+    n = lib.ZSTD_decompress(dst, usize, src, len(payload))
+    if lib.ZSTD_isError(n):
+        return None
+    return dst.raw[:n]
+
+
+def decode_payload(payload, flags):
+    comp = flags & (COMPRESSED_ZLIB | COMPRESSED_ZSTD)
+    if comp == COMPRESSED_ZSTD:
+        return zstd_decompress(payload)
+    if comp == COMPRESSED_ZLIB:
+        return quncompress(payload)
+    if comp == 0:
+        return payload
+    return None
+
+
+def looks_like_text(raw):
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not text:
+        return text
+    controls = 0
+    for ch in text:
+        o = ord(ch)
+        if o < 32 and ch not in "\t\n\r":
+            controls += 1
+            if controls > max(2, len(text) // 50):
+                return None
+    return text
+
+
+class Node:
+    __slots__ = ("index", "name_off", "flags", "child_count", "child_off", "data_off")
+
+    def __init__(self, index, name_off, flags):
+        self.index = index
+        self.name_off = name_off
+        self.flags = flags
+        self.child_count = 0
+        self.child_off = 0
+        self.data_off = 0
+
+    @property
+    def is_dir(self):
+        return bool(self.flags & DIRECTORY)
+
+
+def read_node(buf, start, index, node_size):
+    off = start + index * node_size
+    if off < 0 or off + node_size > len(buf):
+        return None
+    name_off = u32(buf, off)
+    flags = u16(buf, off + 4)
+    if name_off is None or flags is None:
+        return None
+    if flags & ~KNOWN_FLAGS:
+        return None
+    node = Node(index, name_off, flags)
+    if node.is_dir:
+        if flags & (COMPRESSED_ZLIB | COMPRESSED_ZSTD):
+            return None
+        child_count = u32(buf, off + 6)
+        child_off = u32(buf, off + 10)
+        if child_count is None or child_off is None:
+            return None
+        if child_count > MAX_NODES:
+            return None
+        node.child_count = child_count
+        node.child_off = child_off
+    else:
+        data_off = u32(buf, off + 10)
+        if data_off is None or data_off > MAX_PAYLOAD:
+            return None
+        node.data_off = data_off
+    if name_off > MAX_PAYLOAD:
+        return None
+    return node
+
+
+def try_parse_tree(buf, start, node_size):
+    """Parse a resource tree whose root node sits at start.
+
+    rcc lays every node out in 0..N-1 and each node is exactly one directory's
+    child. The root of a non-empty tree always has its first child at index 1.
+    """
+    root = read_node(buf, start, 0, node_size)
+    if root is None or not root.is_dir or root.child_count < 1:
+        return None
+    if root.child_off != 1:
+        return None
+    nodes = {0: root}
+    stack = [0]
+    max_index = 0
+    while stack:
+        idx = stack.pop()
+        node = nodes[idx]
+        if not node.is_dir or node.child_count == 0:
+            continue
+        first = node.child_off
+        if first <= idx:
+            return None
+        last = first + node.child_count - 1
+        if last > MAX_NODES:
+            return None
+        max_index = max(max_index, last)
+        if start + (max_index + 1) * node_size > len(buf):
+            return None
+        for child in range(first, last + 1):
+            if child in nodes:
+                return None
+            parsed = read_node(buf, start, child, node_size)
+            if parsed is None:
+                return None
+            nodes[child] = parsed
+            stack.append(child)
+    if set(nodes) != set(range(max_index + 1)):
+        return None
+    # Child ranges must partition 1..max_index.
+    ranges = []
+    for node in nodes.values():
+        if node.is_dir and node.child_count:
+            ranges.append((node.child_off, node.child_off + node.child_count))
+    ranges.sort()
+    expect = 1
+    for begin, end in ranges:
+        if begin != expect:
+            return None
+        expect = end
+    if expect != max_index + 1:
+        return None
+    return nodes
+
+
+def read_name_table(buf, base, offsets):
+    offs = sorted(set(offsets))
+    if not offs or offs[0] != 0:
+        return None
+    lengths = {}
+    for earlier, later in zip(offs, offs[1:]):
+        gap = later - earlier
+        if gap < 6 or (gap - 6) % 2:
+            return None
+        length = (gap - 6) // 2
+        if length > MAX_NAME:
+            return None
+        lengths[earlier] = length
+    names = {}
+    for off in offs:
+        pos = base + off
+        length = u16(buf, pos)
+        stored = u32(buf, pos + 2)
+        if length is None or stored is None or length > MAX_NAME:
+            return None
+        if off in lengths and length != lengths[off]:
+            return None
+        end = pos + 6 + 2 * length
+        if end > len(buf):
+            return None
+        try:
+            text = buf[pos + 6:end].decode("utf-16-be")
+        except UnicodeDecodeError:
+            return None
+        if qt_hash(text) != stored:
+            return None
+        if any(ord(ch) < 32 for ch in text):
+            return None
+        names[off] = text
+    return names
+
+
+def find_name_bases(buf, offsets, hint):
+    offs = sorted(set(offsets))
+    if not offs or offs[0] != 0:
+        return []
+    if len(offs) == 1:
+        return find_single_name_bases(buf, hint)
+    # The gap between the first two records fixes the first name's length.
+    gap = offs[1] - offs[0]
+    if gap < 6 or (gap - 6) % 2:
+        return []
+    # Every name length except the last is fixed by the gap between offsets.
+    # Checking those length fields rejects the very common short prefixes
+    # (a 2-character "qt" is just 00 02) without hashing each hit.
+    anchors = []
+    for earlier, later in zip(offs, offs[1:]):
+        gap = later - earlier
+        if gap < 6 or (gap - 6) % 2:
+            return []
+        anchors.append((earlier, ((gap - 6) // 2).to_bytes(2, "big")))
+    prefix = anchors[0][1]
+    found = []
+    start = 0
+    while len(found) < 8:
+        pos = buf.find(prefix, start)
+        if pos < 0:
+            break
+        start = pos + 1
+        if pos + offs[-1] + 6 > len(buf):
+            continue
+        if any(buf[pos + off:pos + off + 2] != mark for off, mark in anchors):
+            continue
+        if read_name_table(buf, pos, offs) is not None:
+            found.append(pos)
+    found.sort(key=lambda pos: abs(pos - hint))
+    return found
+
+
+def find_single_name_bases(buf, hint):
+    lo = max(0, hint - 65536)
+    hi = min(len(buf) - 6, hint + 65536)
+    found = []
+    for pos in range(lo, hi):
+        length = u16(buf, pos)
+        if length is None or not 1 <= length <= 240:
+            continue
+        end = pos + 6 + 2 * length
+        if end > len(buf):
+            continue
+        first = u16(buf, pos + 6)
+        if first is None or not 32 <= first < 127:
+            continue
+        table = read_name_table(buf, pos, [0])
+        if table is not None:
+            found.append(pos)
+    found.sort(key=lambda pos: abs(pos - hint))
+    return found[:8]
+
+
+def interesting_name(name):
+    return name == "qmldir" or name.endswith(".qml")
+
+
+def payload_text(payload, flags, name):
+    raw = decode_payload(payload, flags)
+    if raw is None:
+        return None
+    if not interesting_name(name):
+        return True
+    return looks_like_text(raw)
+
+
+def valid_data_chain(buf, base, offsets):
+    offs = sorted(set(offsets))
+    if not offs or offs[0] != 0:
+        return None
+    known = {}
+    for earlier, later in zip(offs, offs[1:]):
+        length = later - earlier - 4
+        if length < 0 or length > MAX_PAYLOAD:
+            return None
+        known[earlier] = length
+    for off, length in known.items():
+        got = u32(buf, base + off)
+        if got != length:
+            return None
+        if base + off + 4 + length > len(buf):
+            return None
+    last = offs[-1]
+    last_len = u32(buf, base + last)
+    if last_len is None or last_len > MAX_PAYLOAD:
+        return None
+    if base + last + 4 + last_len > len(buf):
+        return None
+    if last in known and known[last] != last_len:
+        return None
+    known[last] = last_len
+    return known
+
+
+def decode_at(buf, base, file_nodes, names, lengths):
+    texts = []
+    for node in file_nodes:
+        name = names.get(node.name_off)
+        if name is None:
+            return None
+        off = node.data_off
+        length = lengths.get(off)
+        if length is None:
+            return None
+        payload = buf[base + off + 4:base + off + 4 + length]
+        got = payload_text(payload, node.flags, name)
+        if got is None:
+            return None
+        if isinstance(got, str):
+            texts.append((name, got))
+    return texts
+
+
+def cheap_payload_reject(buf, base, length, flags):
+    """Skip obvious non-payloads before copying or decompressing them."""
+    if length <= 0 or length > MAX_PAYLOAD:
+        return True
+    pos = base + 4
+    if pos + min(length, 8) > len(buf):
+        return True
+    comp = flags & (COMPRESSED_ZLIB | COMPRESSED_ZSTD)
+    if comp == COMPRESSED_ZSTD:
+        return not buf.startswith(ZSTD_MAGIC, pos)
+    if comp == COMPRESSED_ZLIB:
+        # qCompress is a zlib wrapper. CMF is 0x78 for the window sizes rcc uses;
+        # the flag byte depends on the level, so don't pin it to 78 9c / 78 da.
+        return length < 6 or buf[pos + 4] != 0x78
+    first = buf[pos]
+    return first not in range(9, 127) and first != 0xEF
+
+
+def text_score(texts):
+    """None when texts are not believable QML/qmldir. Higher is better.
+
+    An empty file or a directory-listing qmldir (no module/depends/import
+    line) must not throw away real documents that share its resource tree.
+    """
+    if not texts:
+        return None
+    score = 0
+    good = 0
+    for name, text in texts:
+        if not text or not text.strip():
+            continue
+        if name.endswith(".qml"):
+            has_import = "import " in text or text.lstrip().startswith("import\t")
+            if not has_import and "{" not in text:
+                return None
+            score += 10 + text.count("import ")
+            good += 1
+        elif name == "qmldir":
+            if re.search(r"(?m)^[ \t]*(?:module|depends|import)\s+\S+", text):
+                score += 30
+                good += 1
+        else:
+            return None
+        score += min(len(text), 20000) / 100.0
+    if good == 0:
+        return None
+    return score
+
+
+def candidate_data_bases(buf, offsets, file_nodes, hints, wide):
+    offs = sorted(set(offsets))
+    bases = []
+    if len(offs) >= 2:
+        known_first = offs[1] - offs[0] - 4
+        if known_first < 0:
+            return []
+        prefix = known_first.to_bytes(4, "big")
+        start = 0
+        hits = 0
+        while hits < 200:
+            pos = buf.find(prefix, start)
+            if pos < 0:
+                break
+            start = pos + 1
+            hits += 1
+            if valid_data_chain(buf, pos, offs) is not None:
+                bases.append(pos)
+        return bases
+
+    flags = file_nodes[0].flags if file_nodes else 0
+    seen = set()
+
+    def add(pos):
+        if pos is None or pos < 0 or pos in seen or pos + 4 > len(buf):
+            return
+        seen.add(pos)
+        bases.append(pos)
+
+    span = 65536 if wide else 512
+    for hint in hints:
+        for delta in range(0, span):
+            add(hint + delta)
+            add(hint - delta)
+    comp = flags & (COMPRESSED_ZLIB | COMPRESSED_ZSTD)
+    if comp == COMPRESSED_ZSTD:
+        start = 0
+        hits = 0
+        while hits < 200:
+            pos = buf.find(ZSTD_MAGIC, start)
+            if pos < 0:
+                break
+            start = pos + 1
+            hits += 1
+            add(pos - 4)
+    elif comp == COMPRESSED_ZLIB:
+        for magic in ZLIB_MAGICS:
+            start = 0
+            hits = 0
+            while hits < 200:
+                pos = buf.find(magic, start)
+                if pos < 0:
+                    break
+                start = pos + 1
+                hits += 1
+                add(pos - 8)
+    elif wide:
+        # Linker-aligned uncompressed blob that was not sitting next to the tree.
+        limit = len(buf) - 4
+        pos = 0
+        while pos < limit:
+            length = u32(buf, pos)
+            if length is not None and not cheap_payload_reject(buf, pos, length, flags):
+                add(pos)
+            pos += 4
+            if len(bases) > 8000:
+                break
+    return bases
+
+
+def names_have_qml(names):
+    return any(interesting_name(name) for name in names.values())
+
+
+def extract_from_layout(buf, tree_at, name_at, data_at, node_size):
+    nodes = try_parse_tree(buf, tree_at, node_size)
+    if nodes is None:
+        return []
+    name_offsets = [node.name_off for node in nodes.values() if node.index != 0]
+    names = read_name_table(buf, name_at, name_offsets)
+    if names is None or not names_have_qml(names):
+        return []
+    file_nodes = [node for node in nodes.values() if not node.is_dir]
+    if not file_nodes:
+        return []
+    lengths = valid_data_chain(buf, data_at, [node.data_off for node in file_nodes])
+    if lengths is None:
+        return []
+    texts = decode_at(buf, data_at, file_nodes, names, lengths)
+    return texts or []
+
+
+def extract_rcc(buf):
+    if len(buf) < 20 or buf[:4] != b"qres":
+        return []
+    version = buf[7]
+    if not 1 <= version <= 4:
+        return []
+    tree_off = u32(buf, 8)
+    data_off = u32(buf, 12)
+    names_off = u32(buf, 16)
+    if None in (tree_off, data_off, names_off):
+        return []
+    node_size = 22 if version >= 2 else 14
+    try:
+        return extract_from_layout(buf, tree_off, names_off, data_off, node_size)
+    except Exception as exc:
+        debug(f"rcc parse failed: {exc}")
+        return []
+
+
+def extract_embedded(buf):
+    """Find qRegisterResourceData trees by their root-node signature."""
+    found = []
+    seen = set()
+    start = 0
+    trees = 0
+    while trees < 500:
+        pos = buf.find(ROOT_PREFIX, start)
+        if pos < 0 or pos + 14 > len(buf):
+            break
+        start = pos + 1
+        if buf[pos + 10:pos + 14] != CHILD_OFF_ONE:
+            continue
+        child_count = u32(buf, pos + 6)
+        if child_count is None or not 1 <= child_count <= MAX_NODES:
+            continue
+        trees += 1
+        for node_size in (22, 14):
+            nodes = try_parse_tree(buf, pos, node_size)
+            if nodes is None:
+                continue
+            name_offsets = [node.name_off for node in nodes.values() if node.index != 0]
+            name_bases = find_name_bases(buf, name_offsets, pos)
+            bound = False
+            for name_at in name_bases[:4]:
+                names = read_name_table(buf, name_at, name_offsets)
+                if names is None or not names_have_qml(names):
+                    continue
+                bound = True
+                file_nodes = [node for node in nodes.values() if not node.is_dir]
+                if not file_nodes:
+                    break
+                data_offsets = [node.data_off for node in file_nodes]
+                hints = [pos + len(nodes) * node_size, name_at, name_at + 64]
+                best = None
+                checked = 0
+                for wide in (False, True):
+                    if best is not None:
+                        break
+                    bases = candidate_data_bases(
+                        buf, data_offsets, file_nodes, hints, wide
+                    )
+                    for data_at in bases:
+                        checked += 1
+                        if checked > 6000:
+                            break
+                        lengths = valid_data_chain(buf, data_at, data_offsets)
+                        if lengths is None:
+                            continue
+                        # One representative flag is enough for the cheap test
+                        # when every file shares a compression; mixed trees
+                        # still have to decode.
+                        sample = file_nodes[0]
+                        sample_len = lengths.get(sample.data_off, 0)
+                        if cheap_payload_reject(buf, data_at + sample.data_off, sample_len, sample.flags):
+                            continue
+                        texts = decode_at(buf, data_at, file_nodes, names, lengths)
+                        scored = text_score(texts) if texts else None
+                        if scored is None:
+                            continue
+                        dist = abs(data_at - pos)
+                        rank = (scored, -dist)
+                        if best is None or rank > best[0]:
+                            best = (rank, texts)
+                    if len(set(data_offsets)) >= 2:
+                        break
+                if best is not None:
+                    key = tuple(best[1])
+                    if key not in seen:
+                        seen.add(key)
+                        found.extend(best[1])
+                    debug(
+                        f"tree@{pos:#x} node={node_size} names@{name_at:#x} "
+                        f"files={len(best[1])} checked={checked}"
+                    )
+                    break
+            if bound:
+                break
+    return found
+
+
+def extract_qres_blobs(buf):
+    found = []
+    if buf.startswith(b"qres"):
+        found.extend(extract_rcc(buf))
+    # A binary .rcc can also be carried inside another file.
+    start = 1 if buf.startswith(b"qres") else 0
+    hits = 0
+    while hits < 20:
+        pos = buf.find(b"qres", start)
+        if pos < 0:
+            break
+        start = pos + 4
+        hits += 1
+        found.extend(extract_rcc(buf[pos:]))
+    return found
+
+
+def has_qml_filenames(data):
+    return QMLDIR_UTF16 in data or DOT_QML_UTF16 in data
+
+
+def extract_texts(path, data):
+    texts = []
+    if data.startswith(b"qres") or path.endswith(".rcc"):
+        texts.extend(extract_qres_blobs(data))
+    # The symbol is the undefined reference to qRegisterResourceData. The
+    # UTF-16 names are in the resource name table, which rcc never compresses.
+    if data.startswith(b"\x7fELF") and QT_REGISTER in data and has_qml_filenames(data):
+        texts.extend(extract_embedded(data))
+        texts.extend(extract_qres_blobs(data))
+    # Unique by content. The same module is sometimes registered twice.
+    uniq = []
+    seen = set()
+    for name, text in texts:
+        key = (name, text)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((name, text))
+    return uniq
+
+
+MODULE_RE = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+IMPORT_RE = re.compile(
+    rf"^import\s+({MODULE_RE})"
+    rf"(?:\s+(\d+(?:\.\d+)*))?"
+    rf"(?:\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?"
+    rf"\s*;?\s*$"
+)
+QMLDIR_DEP_RE = re.compile(
+    rf"^(?:depends|import)\s+({MODULE_RE})(?:\s+\S+)?\s*$"
+)
+SKIP_QMLDIR = {
+    "module",
+    "plugin",
+    "classname",
+    "typeinfo",
+    "depends",
+    "designersupported",
+    "import",
+    "prefer",
+    "linktarget",
+    "internal",
+    "static",
+    "system",
+    # qt_add_qml_module DEFAULT_IMPORTS: which optional import qmllint assumes.
+    # The engine does not load it on its own.
+    "default",
+}
+
+
+def strip_comments(text):
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end < 0:
+                out.append("\n" * text[i:].count("\n"))
+                break
+            out.append("\n" * text[i:end + 2].count("\n"))
+            i = end + 2
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            if end < 0:
+                break
+            i = end
+            continue
+        ch = text[i]
+        if ch in "\"'":
+            out.append(ch)
+            i += 1
+            while i < n:
+                if text[i] == "\\" and i + 1 < n:
+                    out.append(text[i:i + 2])
+                    i += 2
+                    continue
+                out.append(text[i])
+                if text[i] == ch:
+                    i += 1
+                    break
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def version_newer(left, right):
+    """True when left is strictly newer than right.
+
+    Missing components are 0, matching the old shell generator: 0.0 is not
+    newer than an empty version, so a module whose types are all 0.0 keeps
+    an unversioned qml(Module) provide.
+    """
+    if left == right:
+        return False
+
+    def parts(value):
+        if value == "":
+            return [0]
+        out = []
+        for piece in value.split("."):
+            if not piece.isdigit():
+                return None
+            out.append(int(piece))
+        return out or [0]
+
+    left_parts = parts(left)
+    right_parts = parts(right)
+    if left_parts is None or right_parts is None:
+        return False
+    width = max(len(left_parts), len(right_parts))
+    left_parts.extend([0] * (width - len(left_parts)))
+    right_parts.extend([0] * (width - len(right_parts)))
+    return left_parts > right_parts
+
+
+def qml_imports(text):
+    modules = set()
+    for line in strip_comments(text).splitlines():
+        match = IMPORT_RE.match(line.strip())
+        if match:
+            modules.add(match.group(1))
+    return modules
+
+
+def parse_qmldir(text):
+    """Return (provides, requires) for one qmldir document."""
+    statements = []
+    for raw in text.splitlines():
+        # qmldir comments are '#' (the whole rest of the line).
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        optional = False
+        opt = re.match(r"^optional\b\s*", line)
+        if opt:
+            # Not a hard dependency: the module is allowed to be absent.
+            optional = True
+            line = line[opt.end():].strip()
+            if not line:
+                continue
+        statements.append((optional, line))
+
+    module = ""
+    for _optional, line in statements:
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "module" and re.fullmatch(MODULE_RE, parts[1]):
+            module = parts[1]
+            break
+
+    provides = []
+    requires = set()
+    module_ver = ""
+    for optional, line in statements:
+        if optional:
+            continue
+        dep = QMLDIR_DEP_RE.match(line)
+        if dep and line.split(None, 1)[0] in ("depends", "import"):
+            requires.add(dep.group(1))
+            continue
+        if not module:
+            continue
+        parts = line.split()
+        # Keywords are lowercase. Do not casefold: QtQuick.tooling exports
+        # a type literally named Module.
+        if parts[0] in SKIP_QMLDIR:
+            continue
+        if parts[0] == "singleton":
+            parts = parts[1:]
+        if len(parts) < 2:
+            continue
+        type_name, ver = parts[0], parts[1]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", type_name):
+            continue
+        if ver == "auto":
+            provides.append(f"qml({module}.{type_name})")
+        elif re.fullmatch(r"\d+(?:\.\d+)*", ver):
+            if version_newer(ver, module_ver):
+                module_ver = ver
+            provides.append(f"qml({module}.{type_name}) = {ver}")
+    if module:
+        if module_ver:
+            provides.append(f"qml({module}) = {module_ver}")
+        else:
+            provides.append(f"qml({module})")
+    return provides, requires
+
+
+def provides_and_requires_from_text(name, text):
+    provides = []
+    requires = set()
+    if name == "qmldir":
+        prov, req = parse_qmldir(text)
+        provides.extend(prov)
+        requires.update(req)
+    elif name.endswith(".qml"):
+        requires.update(qml_imports(text))
+    return provides, requires
+
+
+# Qt's qmltyperegistrar replaces every non-alphanumeric with '_'.
+# org.kde.kwin_x11 and org.kde.kwin.x11 become the same symbol.
+_NON_ALNUM = re.compile(r"[^A-Za-z0-9]")
+# One-letter segments (H.B, x.Y) show up in rodata by chance. Logging
+# categories are lowercase qt.*; module URIs shipped by Qt are Qt*.
+_REJECT_SUFFIX = (
+    ".so", ".c", ".cc", ".cpp", ".h", ".hpp", ".qml", ".js", ".mjs", ".qm", ".utf8",
+)
+
+
+def plausible_module(name):
+    if not re.fullmatch(MODULE_RE, name) or len(name) > 200:
+        return False
+    if name.startswith("qt."):
+        return False
+    if name.endswith(_REJECT_SUFFIX):
+        return False
+    if all(len(part) == 1 for part in name.split(".")):
+        return False
+    return True
+
+
+def module_symbol(uri):
+    """Symbol suffix qmltyperegistrar derives from a module URI."""
+    return _NON_ALNUM.sub("_", uri)
+
+
+def register_types_suffix(symbol):
+    """Return the suffix of a defined qml_register_types_* symbol, or None.
+
+    The Itanium form is _Z<length>qml_register_types_<suffix>v. The trailing
+    v is the void parameter and is not part of the length, so a raw scan must
+    not swallow it.
+    """
+    name = symbol.split("@", 1)[0]
+    if not name.startswith("_Z"):
+        return None
+    i = 2
+    while i < len(name) and name[i:i + 1].isdigit():
+        i += 1
+    if i == 2:
+        return None
+    try:
+        length = int(name[2:i])
+    except ValueError:
+        return None
+    body = name[i:i + length]
+    prefix = "qml_register_types_"
+    if len(body) != length or not body.startswith(prefix):
+        return None
+    suffix = body[len(prefix):]
+    if not suffix or suffix[0].isdigit():
+        return None
+    return suffix
+
+
+def _cstrings(data):
+    """NUL-terminated printable strings, bounded on the left by NUL or start."""
+    n = len(data)
+    i = 0
+    while i < n:
+        if data[i] == 0:
+            i += 1
+            continue
+        j = data.find(b"\0", i, i + 201)
+        if j < 0:
+            j = data.find(b"\0", i)
+            if j < 0:
+                break
+            i = j + 1
+            continue
+        raw = data[i:j]
+        if raw and all(32 <= b < 127 for b in raw):
+            yield i, raw.decode()
+        i = j + 1
+
+
+class _Elf:
+    """Just enough of an ELF image to read symbols and executable bytes."""
+
+    def __init__(self, data):
+        if len(data) < 64 or data[:4] != b"\x7fELF":
+            raise ValueError("not an ELF")
+        self.data = data
+        self.cls = data[4]
+        self.endian = data[5]
+        if self.cls not in (1, 2) or self.endian not in (1, 2):
+            raise ValueError("unsupported ELF")
+        self.le = self.endian == 1
+        self.u16 = lambda b, o: int.from_bytes(b[o:o + 2], "little" if self.le else "big")
+        self.u32 = lambda b, o: int.from_bytes(b[o:o + 4], "little" if self.le else "big")
+        self.u64 = lambda b, o: int.from_bytes(b[o:o + 8], "little" if self.le else "big")
+        self.machine = self.u16(data, 18)
+        if self.cls == 2:
+            self.e_shoff = self.u64(data, 40)
+            self.e_shentsize = self.u16(data, 58)
+            self.e_shnum = self.u16(data, 60)
+            self.e_shstrndx = self.u16(data, 62)
+        else:
+            self.e_shoff = self.u32(data, 32)
+            self.e_shentsize = self.u16(data, 46)
+            self.e_shnum = self.u16(data, 48)
+            self.e_shstrndx = self.u16(data, 50)
+        self.sections = self._sections()
+
+    def _sections(self):
+        if self.e_shoff == 0 or self.e_shnum == 0:
+            raise ValueError("no section headers")
+        data = self.data
+        entsize = self.e_shentsize
+        raw = []
+        for i in range(self.e_shnum):
+            off = self.e_shoff + i * entsize
+            if off + entsize > len(data):
+                raise ValueError("truncated section header")
+            if self.cls == 2:
+                name, typ, flags, addr, offset, size, link, info, addralign, sent = (
+                    struct.unpack_from("<IIQQQQIIQQ" if self.le else ">IIQQQQIIQQ", data, off)
+                )
+            else:
+                name, typ, flags, addr, offset, size, link, info, addralign, sent = (
+                    struct.unpack_from("<IIIIIIIIII" if self.le else ">IIIIIIIIII", data, off)
+                )
+            raw.append({
+                "name_off": name,
+                "type": typ,
+                "flags": flags,
+                "addr": addr,
+                "offset": offset,
+                "size": size,
+                "entsize": sent,
+            })
+        if self.e_shstrndx >= len(raw):
+            raise ValueError("bad shstrndx")
+        shstr = raw[self.e_shstrndx]
+        blob = data[shstr["offset"]:shstr["offset"] + shstr["size"]]
+        for sec in raw:
+            no = sec["name_off"]
+            end = blob.find(b"\0", no)
+            sec["name"] = blob[no:end].decode() if end >= 0 else ""
+        return raw
+
+    def section(self, name):
+        for sec in self.sections:
+            if sec["name"] == name:
+                return sec
+        return None
+
+    def va_to_off(self, addr):
+        for sec in self.sections:
+            size = sec["size"]
+            if size and sec["addr"] <= addr < sec["addr"] + size:
+                return sec["offset"] + (addr - sec["addr"])
+        return None
+
+    def cstring_at(self, addr):
+        off = self.va_to_off(addr)
+        if off is None or off < 0 or off >= len(self.data):
+            return None
+        end = self.data.find(b"\0", off, off + 201)
+        if end < 0:
+            return None
+        raw = self.data[off:end]
+        if not raw or any(b < 32 or b >= 127 for b in raw):
+            return None
+        return raw.decode()
+
+    def bytes_at(self, addr, n):
+        """Raw bytes at a virtual address, or None if they are not in a section."""
+        if n <= 0:
+            return b""
+        for sec in self.sections:
+            size = sec["size"]
+            # SHT_NOBITS has an address but no file bytes.
+            if not size or sec["type"] == 8:
+                continue
+            if sec["addr"] <= addr and addr + n <= sec["addr"] + size:
+                off = sec["offset"] + (addr - sec["addr"])
+                if off < 0 or off + n > len(self.data):
+                    return None
+                return self.data[off:off + n]
+        return None
+
+    def symbols(self):
+        """Yield (name, value, defined) from .dynsym and .symtab."""
+        seen = set()
+        for sym_name, str_name in ((".dynsym", ".dynstr"), (".symtab", ".strtab")):
+            sym = self.section(sym_name)
+            strtab = self.section(str_name)
+            if sym is None or strtab is None or sym["size"] == 0:
+                continue
+            entsize = sym["entsize"] or (24 if self.cls == 2 else 16)
+            blob = self.data
+            strings = blob[strtab["offset"]:strtab["offset"] + strtab["size"]]
+            count = sym["size"] // entsize
+            for i in range(count):
+                off = sym["offset"] + i * entsize
+                if self.cls == 2:
+                    st_name, st_info, st_other, st_shndx, st_value, st_size = (
+                        struct.unpack_from("<IBBHQQ" if self.le else ">IBBHQQ", blob, off)
+                    )
+                else:
+                    st_name, st_value, st_size, st_info, st_other, st_shndx = (
+                        struct.unpack_from("<IIIBBH" if self.le else ">IIIBBH", blob, off)
+                    )
+                if st_name >= len(strings):
+                    continue
+                end = strings.find(b"\0", st_name)
+                name = strings[st_name:end if end >= 0 else st_name]
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                # SHN_UNDEF is 0. Anything else is a definition (or ABS).
+                yield name, st_value, st_shndx != 0
+
+    def relocations(self, section_name):
+        sec = self.section(section_name)
+        if sec is None or sec["size"] == 0:
+            return
+        entsize = sec["entsize"] or (24 if self.cls == 2 else 12)
+        blob = self.data
+        step = entsize
+        for i in range(sec["size"] // step):
+            off = sec["offset"] + i * step
+            if self.cls == 2:
+                r_offset, r_info, _addend = struct.unpack_from(
+                    "<QQq" if self.le else ">QQq", blob, off
+                )
+                sym = r_info >> 32
+            else:
+                r_offset, r_info = struct.unpack_from("<Ii" if self.le else ">Ii", blob, off)
+                # ELF32 RELA is 12 bytes: offset, info, addend. REL is 8.
+                sym = r_info >> 8
+            yield i, r_offset, sym
+
+    def exec_ranges(self):
+        for sec in self.sections:
+            if sec["flags"] & 0x4 and sec["size"] and not sec["name"].startswith(".plt"):
+                yield sec["addr"], self.data[sec["offset"]:sec["offset"] + sec["size"]]
+
+
+def _registration_kind(name):
+    """How a Qt registration import passes the module URI."""
+    base = name.split(b"@", 1)[0]
+    if base == b"_Z17qmlRegisterModulePKcii":
+        return "rdi"  # qmlRegisterModule(uri, major, minor)
+    # Seals a module this object just registered types into. The URI is the
+    # module name. qmlRegisterModuleImport is not here: that is a dependency.
+    if base == b"_Z16qmlProtectModulePKci":
+        return "rdi"
+    if base == b"_Z27qmlRegisterTypeNotAvailablePKciiS0_RK7QString":
+        return "rdi"
+    if base.startswith(b"_ZN22QQmlModuleRegistrationC1EPKc") or base.startswith(
+        b"_ZN22QQmlModuleRegistrationC2EPKc"
+    ):
+        return "rsi"  # (this, uri, ...)
+    if base == b"_Z32qmlRegisterUncreatableMetaObjectRK11QMetaObjectPKciiS3_RK7QString":
+        return "rsi"  # (meta, uri, major, minor, name, reason)
+    if base == b"_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv":
+        return "struct"
+    return None
+
+
+def _symbol_modules(elf):
+    """Modules whose qml_register_types_* symbol is defined in this file.
+
+    A defined symbol plus exactly one C string that mangles to the same suffix
+    is the module URI. Two strings (kwin_x11 and kwin.x11) are left for the
+    call scanner, which sees the real literal. Undefined references are not
+    provides: libQt6Quick references qml_register_types_QtQml, it does not
+    register that module.
+    """
+    suffixes = set()
+    for name, _value, defined in elf.symbols():
+        if not defined:
+            continue
+        try:
+            text = name.decode()
+        except UnicodeDecodeError:
+            continue
+        suffix = register_types_suffix(text)
+        if suffix:
+            suffixes.add(suffix)
+    if not suffixes:
+        return set()
+    by_symbol = {}
+    for _off, text in _cstrings(elf.data):
+        if not plausible_module(text):
+            continue
+        by_symbol.setdefault(module_symbol(text), set()).add(text)
+    found = set()
+    for suffix in suffixes:
+        matches = by_symbol.get(suffix)
+        if matches is not None and len(matches) == 1:
+            found.add(next(iter(matches)))
+    return found
+
+
+def _call_targets(elf):
+    """Map a call/jump target address to an argument kind.
+
+    Covers both PLT stubs (undefined imports) and direct calls to a
+    registration function defined in this file (libQt6Qml calling itself).
+    """
+    names = {}
+    for name, value, defined in elf.symbols():
+        kind = _registration_kind(name)
+        if kind is None:
+            continue
+        names.setdefault(name, (kind, value if defined else 0, defined))
+    targets = {}
+    # Direct calls to a defined function.
+    for name, (kind, value, defined) in names.items():
+        if defined and value:
+            targets[value] = kind
+    rela = elf.section(".rela.plt")
+    plt = elf.section(".plt")
+    if rela is None or plt is None or elf.cls != 2 or not elf.le:
+        return targets
+    # Symbol index -> kind, for JUMP_SLOT entries.
+    dynsyms = []
+    dynsym = elf.section(".dynsym")
+    dynstr = elf.section(".dynstr")
+    if dynsym is None or dynstr is None:
+        return targets
+    entsize = dynsym["entsize"] or 24
+    strings = elf.data[dynstr["offset"]:dynstr["offset"] + dynstr["size"]]
+    for i in range(dynsym["size"] // entsize):
+        off = dynsym["offset"] + i * entsize
+        st_name = elf.u32(elf.data, off)
+        end = strings.find(b"\0", st_name)
+        dynsyms.append(strings[st_name:end if end >= 0 else st_name])
+    plt_bytes = elf.data[plt["offset"]:plt["offset"] + plt["size"]]
+    plt_addr = plt["addr"]
+    for index, got, symi in elf.relocations(".rela.plt"):
+        if symi >= len(dynsyms):
+            continue
+        kind = _registration_kind(dynsyms[symi])
+        if kind is None:
+            continue
+        stub = _x86_plt_stub(plt_bytes, plt_addr, index, got)
+        if stub is None and elf.machine == 183:
+            stub = _aarch64_plt_stub(plt_bytes, plt_addr, got)
+        if stub is not None:
+            targets[stub] = kind
+    return targets
+
+
+def _x86_plt_stub(plt, plt_addr, index, got):
+    """Address of the classic (or CET) x86-64 PLT stub for relocation index."""
+    # push imm32 of the relocation index sits 6 bytes after jmp *got(%rip).
+    marker = b"\x68" + int(index).to_bytes(4, "little")
+    start = 0
+    while True:
+        found = plt.find(marker, start)
+        if found < 6:
+            break
+        if plt[found - 6:found - 4] == b"\xff\x25":
+            disp = int.from_bytes(plt[found - 4:found], "little", signed=True)
+            stub = plt_addr + found - 6
+            if stub + 6 + disp == got:
+                return stub
+        start = found + 1
+    # CET .plt.sec: endbr64; jmp *got  with no push. Stride is 16, resolver
+    # may or may not occupy the first slot.
+    for addr in (plt_addr + 16 * (index + 1), plt_addr + 16 * index):
+        for delta in (0, 4):
+            off = addr + delta - plt_addr
+            if off < 0 or off + 6 > len(plt) or plt[off:off + 2] != b"\xff\x25":
+                continue
+            disp = int.from_bytes(plt[off + 2:off + 6], "little", signed=True)
+            if addr + delta + 6 + disp == got:
+                return addr
+    return None
+
+
+def _aarch64_plt_stub(plt, plt_addr, got):
+    """Address of the adrp/ldr/br stub whose GOT slot is got."""
+    limit = len(plt) - 16
+    off = 0
+    while off <= limit:
+        words = [
+            int.from_bytes(plt[off + 4 * n:off + 4 * n + 4], "little")
+            for n in range(4)
+        ]
+        pc = plt_addr + off
+        adrp = _aarch64_adrp(words[0], pc)
+        ldr = _aarch64_ldr64(words[1])
+        got_ok = (
+            adrp is not None
+            and ldr is not None
+            and adrp[0] == 16
+            and ldr[1] == 16
+            and adrp[1] + ldr[2] == got
+        )
+        # adrp; ldr; br   or   adrp; ldr; add; br
+        br_ok = _aarch64_br(words[2]) == 17 or (
+            _aarch64_br(words[3]) == 17 and _aarch64_add_imm(words[2]) is not None
+        )
+        if got_ok and br_ok:
+            return pc
+        off += 4
+    return None
+
+
+def _modules_from_calls(elf):
+    if elf.cls != 2 or not elf.le or elf.machine not in (62, 183):
+        return set()
+    targets = _call_targets(elf)
+    if not targets:
+        return set()
+    found = set()
+    for base, blob in elf.exec_ranges():
+        if elf.machine == 62:
+            found.update(_x86_call_modules(elf, blob, base, targets))
+        else:
+            found.update(_aarch64_call_modules(elf, blob, base, targets))
+    return found
+
+
+def _take_module(elf, addr):
+    text = elf.cstring_at(addr)
+    if text and plausible_module(text):
+        return text
+    return None
+
+
+def _x86_rip_leas(blob, base):
+    """Yield (offset, reg, target) for `lea r64, [rip+disp]`."""
+    start = 0
+    while True:
+        found = blob.find(b"\x8d", start)
+        if found < 1 or found + 6 > len(blob):
+            break
+        rex = blob[found - 1]
+        modrm = blob[found + 1]
+        if rex in (0x48, 0x4C) and (modrm & 0xC7) == 0x05:
+            reg = ((modrm >> 3) & 7) + (8 if rex & 4 else 0)
+            disp = int.from_bytes(blob[found + 2:found + 6], "little", signed=True)
+            lea_at = found - 1
+            target = base + lea_at + 7 + disp
+            yield lea_at, reg, target
+            start = found + 6
+            continue
+        start = found + 1
+
+
+def _x86_rsp_slots(blob, lo, hi):
+    """Yield (off, dest_reg, slot) for `lea reg, [rsp+slot]` and `mov reg, rsp`."""
+    start = lo
+    while start < hi:
+        rex_at = blob.find(b"\x48", start, hi)
+        rex_at_b = blob.find(b"\x4c", start, hi)
+        rex_at_49 = blob.find(b"\x49", start, hi)
+        candidates = [n for n in (rex_at, rex_at_b, rex_at_49) if n >= 0]
+        if not candidates:
+            break
+        at = min(candidates)
+        rex = blob[at]
+        if at + 2 >= len(blob):
+            break
+        opcode = blob[at + 1]
+        modrm = blob[at + 2]
+        mod = modrm >> 6
+        reg = (modrm >> 3) & 7
+        rm = modrm & 7
+        if opcode == 0x89 and mod == 3 and reg == 4 and (rex & 4) == 0 and rex in (0x48, 0x49):
+            # mov r64, rsp. 49 is rex.W|rex.B, so the destination can be r8-r15.
+            dest = rm + (8 if rex & 1 else 0)
+            yield at, dest, 0
+            start = at + 3
+            continue
+        if opcode == 0x8D and rex in (0x48, 0x4C) and rm == 4:
+            dest = reg + (8 if rex & 4 else 0)
+            if mod == 0 and at + 4 <= len(blob) and blob[at + 3] == 0x24:
+                yield at, dest, 0
+                start = at + 4
+                continue
+            if mod == 1 and at + 5 <= len(blob) and blob[at + 3] == 0x24:
+                disp = int.from_bytes(blob[at + 4:at + 5], "little", signed=True)
+                yield at, dest, disp
+                start = at + 5
+                continue
+            if mod == 2 and at + 8 <= len(blob) and blob[at + 3] == 0x24:
+                disp = int.from_bytes(blob[at + 4:at + 8], "little", signed=True)
+                yield at, dest, disp
+                start = at + 8
+                continue
+        start = at + 1
+
+
+def _x86_last_pointer(blob, base, lo, hi, reg):
+    """Last value put in reg before hi: ('rip', va) or ('slot', rsp_disp)."""
+    best = None
+    for off, lreg, target in _x86_rip_leas(blob[lo:hi], base + lo):
+        if lreg != reg:
+            continue
+        abs_off = lo + off
+        if best is None or abs_off > best[0]:
+            best = (abs_off, ("rip", target))
+    for off, lreg, slot in _x86_rsp_slots(blob, lo, hi):
+        if lreg != reg:
+            continue
+        if best is None or off > best[0]:
+            best = (off, ("slot", slot))
+    if best is None:
+        return None
+    return best[1]
+
+
+def _module_from_stack(image, slot):
+    """NUL-terminated module name reconstructed at [rsp+slot]."""
+    if not image:
+        return None
+    chars = []
+    disp = slot
+    while disp in image:
+        byte = image[disp]
+        if byte == 0:
+            text = "".join(chars)
+            return text if plausible_module(text) else None
+        if byte < 32 or byte >= 127 or len(chars) >= 200:
+            return None
+        chars.append(chr(byte))
+        disp += 1
+    return None
+
+
+def _x86_write(mem, disp, raw):
+    for i, byte in enumerate(raw):
+        mem[disp + i] = byte
+
+
+def _x86_sse_mov(blob, at, prefix, rex):
+    """movaps/movups/movdqa/movdqu. Returns (is_load, reg, mode, disp, nbytes, next) or None.
+
+    `at` points at the 0F byte. mode is 'rip' or 'rsp'.
+    """
+    if at + 3 > len(blob):
+        return None
+    opcode = blob[at + 1]
+    modrm = blob[at + 2]
+    mod = modrm >> 6
+    reg = ((modrm >> 3) & 7) + (8 if rex is not None and rex & 4 else 0)
+    rm = modrm & 7
+    if prefix in (None, 0x66) and opcode in (0x28, 0x29, 0x10, 0x11):
+        nbytes = 16
+    elif prefix in (0x66, 0xF3) and opcode in (0x6F, 0x7F):
+        nbytes = 16
+    else:
+        return None
+    is_load = opcode in (0x10, 0x28, 0x6F)
+    if mod == 0 and rm == 5 and at + 7 <= len(blob):
+        disp = int.from_bytes(blob[at + 3:at + 7], "little", signed=True)
+        return is_load, reg, "rip", disp, nbytes, at + 7
+    if rm == 4:
+        sib_at = at + 3
+        if sib_at >= len(blob) or blob[sib_at] != 0x24:
+            return None
+        if mod == 0 and sib_at + 1 <= len(blob):
+            return is_load, reg, "rsp", 0, nbytes, sib_at + 1
+        if mod == 1 and sib_at + 2 <= len(blob):
+            disp = int.from_bytes(blob[sib_at + 1:sib_at + 2], "little", signed=True)
+            return is_load, reg, "rsp", disp, nbytes, sib_at + 2
+        if mod == 2 and sib_at + 5 <= len(blob):
+            disp = int.from_bytes(blob[sib_at + 1:sib_at + 5], "little", signed=True)
+            return is_load, reg, "rsp", disp, nbytes, sib_at + 5
+    return None
+
+
+def _x86_vex_mov(blob, at):
+    """VEX vmovups/vmovaps/vmovdqu. Returns (is_load, reg, mode, disp, nbytes, next) or None.
+
+    Clang copies an aligned stack array with vmovaps (opcode 28/29). vmovups
+    alone misses that, so a module such as org.kde.private.kcms.keys is required
+    by the embedded QML and never provided.
+    """
+    if blob[at] == 0xC5 and at + 4 <= len(blob):
+        vex = blob[at + 1]
+        opcode = blob[at + 2]
+        modrm_at = at + 3
+        pp = vex & 3
+        wide = (vex >> 2) & 1
+        high = 0 if vex & 0x80 else 8
+        rex_b = 0
+    elif blob[at] == 0xC4 and at + 5 <= len(blob):
+        b1 = blob[at + 1]
+        b2 = blob[at + 2]
+        if (b1 & 0x1F) != 1:
+            return None
+        opcode = blob[at + 3]
+        modrm_at = at + 4
+        pp = b2 & 3
+        wide = (b2 >> 2) & 1
+        high = 0 if b1 & 0x80 else 8
+        # Inverted B. Set means rm is r12 rather than rsp; not a frame slot.
+        rex_b = 0 if b1 & 0x20 else 1
+    else:
+        return None
+    # 10/11 movups, 28/29 movaps: pp 0 (none) or 1 (66, the packed-double form,
+    # same width). 6F/7F movdqu/movdqa.
+    if opcode in (0x10, 0x11, 0x28, 0x29) and pp not in (0, 1):
+        return None
+    if opcode in (0x6F, 0x7F) and pp not in (1, 2):
+        return None
+    if opcode not in (0x10, 0x11, 0x28, 0x29, 0x6F, 0x7F):
+        return None
+    if modrm_at >= len(blob):
+        return None
+    modrm = blob[modrm_at]
+    mod = modrm >> 6
+    reg = ((modrm >> 3) & 7) + high
+    rm = modrm & 7
+    is_load = opcode in (0x10, 0x28, 0x6F)
+    nbytes = 32 if wide else 16
+    if mod == 0 and rm == 5 and modrm_at + 5 <= len(blob):
+        disp = int.from_bytes(blob[modrm_at + 1:modrm_at + 5], "little", signed=True)
+        return is_load, reg, "rip", disp, nbytes, modrm_at + 5
+    if rm != 4 or rex_b:
+        return None
+    sib_at = modrm_at + 1
+    if sib_at >= len(blob) or blob[sib_at] != 0x24:
+        return None
+    if mod == 0:
+        return is_load, reg, "rsp", 0, nbytes, sib_at + 1
+    if mod == 1 and sib_at + 2 <= len(blob):
+        disp = int.from_bytes(blob[sib_at + 1:sib_at + 2], "little", signed=True)
+        return is_load, reg, "rsp", disp, nbytes, sib_at + 2
+    if mod == 2 and sib_at + 5 <= len(blob):
+        disp = int.from_bytes(blob[sib_at + 1:sib_at + 5], "little", signed=True)
+        return is_load, reg, "rsp", disp, nbytes, sib_at + 5
+    return None
+
+
+def _x86_imm_store(blob, at):
+    """movl/movw/movb $imm, disp(%rsp). Returns (disp, raw, next) or None."""
+    if blob[at] == 0x66 and at + 3 < len(blob) and blob[at + 1] == 0xC7:
+        op = at + 1
+        width = 2
+    elif blob[at] in (0xC6, 0xC7):
+        op = at
+        width = 1 if blob[at] == 0xC6 else 4
+    else:
+        return None
+    if op + 2 >= len(blob):
+        return None
+    modrm = blob[op + 1]
+    mod = modrm >> 6
+    reg = (modrm >> 3) & 7
+    rm = modrm & 7
+    if reg != 0 or rm != 4:
+        return None
+    if mod == 0 and op + 3 + width <= len(blob) and blob[op + 2] == 0x24:
+        disp_at = op + 3
+        disp = 0
+        next_off = disp_at + width
+    elif mod == 1 and op + 4 + width <= len(blob) and blob[op + 2] == 0x24:
+        disp = int.from_bytes(blob[op + 3:op + 4], "little", signed=True)
+        disp_at = op + 4
+        next_off = disp_at + width
+    elif mod == 2 and op + 7 + width <= len(blob) and blob[op + 2] == 0x24:
+        disp = int.from_bytes(blob[op + 3:op + 7], "little", signed=True)
+        disp_at = op + 7
+        next_off = disp_at + width
+    else:
+        return None
+    if next_off > len(blob):
+        return None
+    return disp, blob[disp_at:disp_at + width], next_off
+
+
+def _x86_gpr_rip_load(blob, base, at):
+    """mov r64, [rip+disp]. Returns (reg, addr, next) or None."""
+    if at + 7 > len(blob) or blob[at] not in (0x48, 0x4C) or blob[at + 1] != 0x8B:
+        return None
+    modrm = blob[at + 2]
+    if (modrm & 0xC7) != 0x05:
+        return None
+    reg = ((modrm >> 3) & 7) + (8 if blob[at] & 4 else 0)
+    disp = int.from_bytes(blob[at + 3:at + 7], "little", signed=True)
+    return reg, base + at + 7 + disp, at + 7
+
+
+def _x86_gpr_rsp_store(blob, at):
+    """mov [rsp+disp], r64. Returns (reg, disp, next) or None. Not `mov reg, rsp`."""
+    if at + 3 > len(blob) or blob[at] not in (0x48, 0x4C) or blob[at + 1] != 0x89:
+        return None
+    modrm = blob[at + 2]
+    mod = modrm >> 6
+    reg = ((modrm >> 3) & 7) + (8 if blob[at] & 4 else 0)
+    rm = modrm & 7
+    if mod == 3 or rm != 4:
+        return None
+    if mod == 0 and at + 4 <= len(blob) and blob[at + 3] == 0x24:
+        return reg, 0, at + 4
+    if mod == 1 and at + 5 <= len(blob) and blob[at + 3] == 0x24:
+        disp = int.from_bytes(blob[at + 4:at + 5], "little", signed=True)
+        return reg, disp, at + 5
+    if mod == 2 and at + 8 <= len(blob) and blob[at + 3] == 0x24:
+        disp = int.from_bytes(blob[at + 4:at + 8], "little", signed=True)
+        return reg, disp, at + 8
+    return None
+
+
+def _x86_stack_image(elf, blob, base, lo, hi):
+    """Bytes written to [rsp+disp] before hi.
+
+    `const char uri[] = "module"` is a copy onto the stack. Clang keeps the
+    literal in rodata and loads it; GCC on x86-64 splits it into 16-byte
+    chunks plus an immediate tail, so the module name exists only once the
+    stores are replayed. Short names are often immediates alone.
+    """
+    mem = {}
+    loaded = {}
+    at = lo
+    limit = min(hi, len(blob))
+    while at < limit:
+        # Legacy SSE, optional 66/F2/F3 or a one-byte rex.
+        prefix = None
+        rex = None
+        op_at = None
+        if blob[at] in (0x66, 0xF2, 0xF3) and at + 1 < limit and blob[at + 1] == 0x0F:
+            prefix = blob[at]
+            op_at = at + 1
+        elif blob[at] in range(0x40, 0x50) and at + 1 < limit and blob[at + 1] == 0x0F:
+            rex = blob[at]
+            op_at = at + 1
+        elif blob[at] == 0x0F:
+            op_at = at
+        if op_at is not None:
+            sse = _x86_sse_mov(blob, op_at, prefix, rex)
+            if sse is not None:
+                is_load, reg, mode, disp, nbytes, next_off = sse
+                if is_load and mode == "rip":
+                    loaded[("vec", reg)] = (base + op_at + 7 + disp, nbytes)
+                elif not is_load and mode == "rsp":
+                    src = loaded.get(("vec", reg))
+                    if src is not None:
+                        raw = elf.bytes_at(src[0], min(src[1], nbytes))
+                        if raw:
+                            _x86_write(mem, disp, raw)
+                at = next_off
+                continue
+        if blob[at] in (0xC5, 0xC4):
+            vex = _x86_vex_mov(blob, at)
+            if vex is not None:
+                is_load, reg, mode, disp, nbytes, next_off = vex
+                if is_load and mode == "rip":
+                    # next_off is the end of the instruction, which is rip.
+                    loaded[("vec", reg)] = (base + next_off + disp, nbytes)
+                elif not is_load and mode == "rsp":
+                    src = loaded.get(("vec", reg))
+                    if src is not None:
+                        raw = elf.bytes_at(src[0], min(src[1], nbytes))
+                        if raw:
+                            _x86_write(mem, disp, raw)
+                at = next_off
+                continue
+        if blob[at] == 0x66 or blob[at] in (0xC6, 0xC7):
+            imm = _x86_imm_store(blob, at)
+            if imm is not None:
+                disp, raw, next_off = imm
+                _x86_write(mem, disp, raw)
+                at = next_off
+                continue
+        gpr = _x86_gpr_rip_load(blob, base, at)
+        if gpr is not None:
+            reg, addr, next_off = gpr
+            loaded[("gpr", reg)] = (addr, 8)
+            at = next_off
+            continue
+        store = _x86_gpr_rsp_store(blob, at)
+        if store is not None:
+            reg, disp, next_off = store
+            src = loaded.get(("gpr", reg))
+            if src is not None:
+                raw = elf.bytes_at(src[0], min(src[1], 8))
+                if raw:
+                    _x86_write(mem, disp, raw)
+            at = next_off
+            continue
+        if blob[at] == 0xE8 and at + 5 <= limit:
+            loaded.clear()
+            at += 5
+            continue
+        at += 1
+    return mem
+
+
+def _x86_arg_module(elf, blob, base, call_off, reg, window):
+    """Module string last placed in an argument register before call_off."""
+    lo = max(0, call_off - window)
+    ptr = _x86_last_pointer(blob, base, lo, call_off, reg)
+    if ptr is None:
+        return None
+    if ptr[0] == "rip":
+        return _take_module(elf, ptr[1])
+    pad = blob.rfind(b"\xcc\xcc\xcc\xcc", max(0, call_off - 20000), call_off)
+    start = pad + 4 if pad >= 0 else max(0, call_off - 0x2000)
+    image = _x86_stack_image(elf, blob, base, start, call_off)
+    return _module_from_stack(image, ptr[1])
+
+
+def _x86_reg_stores(blob, lo, hi):
+    """mov r64 -> disp8/32(%rsp or %rbp). Yields (off, src_reg, base_reg, disp)."""
+    start = lo
+    while start < hi:
+        found = blob.find(b"\x89", start, hi)
+        if found < 1:
+            break
+        rex = blob[found - 1]
+        if rex not in (0x48, 0x4C) or found + 2 >= len(blob):
+            start = found + 1
+            continue
+        modrm = blob[found + 1]
+        src = ((modrm >> 3) & 7) + (8 if rex & 4 else 0)
+        mod = modrm >> 6
+        rm = modrm & 7
+        if mod == 1 and rm == 4 and found + 4 <= len(blob) and blob[found + 2] == 0x24:
+            disp = int.from_bytes(blob[found + 3:found + 4], "little", signed=True)
+            yield found - 1, src, 4, disp
+            start = found + 4
+            continue
+        if mod == 2 and rm == 4 and found + 7 <= len(blob) and blob[found + 2] == 0x24:
+            disp = int.from_bytes(blob[found + 3:found + 7], "little", signed=True)
+            yield found - 1, src, 4, disp
+            start = found + 7
+            continue
+        if mod == 1 and rm == 5 and found + 3 <= len(blob):
+            disp = int.from_bytes(blob[found + 2:found + 3], "little", signed=True)
+            yield found - 1, src, 5, disp
+            start = found + 3
+            continue
+        if mod == 2 and rm == 5 and found + 6 <= len(blob):
+            disp = int.from_bytes(blob[found + 2:found + 6], "little", signed=True)
+            yield found - 1, src, 5, disp
+            start = found + 6
+            continue
+        start = found + 1
+
+
+def _x86_movw(blob, lo, hi):
+    """movw imm16 -> disp(%rsp or %rbp). Yields (off, base_reg, disp)."""
+    start = lo
+    needle = b"\x66\xc7"
+    while start < hi:
+        found = blob.find(needle, start, hi)
+        if found < 0 or found + 4 > len(blob):
+            break
+        modrm = blob[found + 2]
+        mod = modrm >> 6
+        reg = (modrm >> 3) & 7
+        rm = modrm & 7
+        if reg != 0:
+            start = found + 1
+            continue
+        if mod == 1 and rm == 4 and found + 7 <= len(blob) and blob[found + 3] == 0x24:
+            disp = int.from_bytes(blob[found + 4:found + 5], "little", signed=True)
+            yield found, 4, disp
+            start = found + 7
+            continue
+        if mod == 2 and rm == 4 and found + 10 <= len(blob) and blob[found + 3] == 0x24:
+            disp = int.from_bytes(blob[found + 4:found + 8], "little", signed=True)
+            yield found, 4, disp
+            start = found + 10
+            continue
+        if mod == 1 and rm == 5 and found + 6 <= len(blob):
+            disp = int.from_bytes(blob[found + 3:found + 4], "little", signed=True)
+            yield found, 5, disp
+            start = found + 6
+            continue
+        if mod == 2 and rm == 5 and found + 9 <= len(blob):
+            disp = int.from_bytes(blob[found + 3:found + 7], "little", signed=True)
+            yield found, 5, disp
+            start = found + 9
+            continue
+        start = found + 1
+
+
+def _x86_struct_modules(elf, blob, base, call_off):
+    """URI field of a QQmlPrivate::Register* struct passed to qmlregister.
+
+    On the LP64 Qt 6 ABI the URI pointer is immediately followed by a
+    QTypeRevision (uint16). Clang stores that pair as `mov reg, disp(%rsp)`
+    plus `movw imm, disp+8(%rsp)` next to the call. The register was loaded
+    with `lea reg, [rip+uri]`.
+    """
+    pad = blob.rfind(b"\xcc\xcc\xcc\xcc", max(0, call_off - 20000), call_off)
+    start = pad + 4 if pad >= 0 else max(0, call_off - 20000)
+    leas = {}
+    for off, reg, target in _x86_rip_leas(blob[start:call_off], base + start):
+        leas.setdefault(reg, []).append((start + off, ("rip", target)))
+    for off, reg, slot in _x86_rsp_slots(blob, start, call_off):
+        leas.setdefault(reg, []).append((off, ("slot", slot)))
+    window = max(start, call_off - 0x200)
+    stores = list(_x86_reg_stores(blob, window, call_off))
+    words = list(_x86_movw(blob, window, call_off))
+    # One registration per call. Earlier calls in the same function leave
+    # the same store/movw shape behind; only the fill closest to this call
+    # belongs to it.
+    best = None
+    for soff, reg, sbase, disp in stores:
+        if not any(
+            mbase == sbase and mdisp == disp + 8 and abs(moff - soff) < 48
+            for moff, mbase, mdisp in words
+        ):
+            continue
+        choice = None
+        for loff, ptr in leas.get(reg, ()):
+            if loff < soff and (choice is None or loff > choice[0]):
+                choice = (loff, ptr)
+        if choice is None:
+            continue
+        if best is None or soff > best[0]:
+            best = (soff, choice[1])
+    if best is None:
+        return set()
+    kind, val = best[1]
+    if kind == "rip":
+        module = _take_module(elf, val)
+    else:
+        image = _x86_stack_image(elf, blob, base, start, call_off)
+        module = _module_from_stack(image, val)
+    return {module} if module else set()
+
+
+def _x86_call_modules(elf, blob, base, targets):
+    found = set()
+    for opcode in (0xE8, 0xE9):
+        start = 0
+        needle = bytes((opcode,))
+        while True:
+            at = blob.find(needle, start)
+            if at < 0 or at + 5 > len(blob):
+                break
+            disp = int.from_bytes(blob[at + 1:at + 5], "little", signed=True)
+            kind = targets.get(base + at + 5 + disp)
+            if kind == "rdi":
+                module = _x86_arg_module(elf, blob, base, at, 7, 64)
+                if module:
+                    found.add(module)
+            elif kind == "rsi":
+                module = _x86_arg_module(elf, blob, base, at, 6, 96)
+                if module:
+                    found.add(module)
+            elif kind == "struct":
+                found.update(_x86_struct_modules(elf, blob, base, at))
+            start = at + 1
+    return found
+
+
+def _aarch64_adrp(word, pc):
+    if (word & 0x9F000000) != 0x90000000:
+        return None
+    rd = word & 0x1F
+    imm = ((word >> 5) & 0x7FFFF) << 2 | ((word >> 29) & 3)
+    if imm & (1 << 20):
+        imm -= 1 << 21
+    return rd, (pc & ~0xFFF) + (imm << 12)
+
+
+def _aarch64_add_imm(word):
+    if (word & 0xFF800000) != 0x91000000:
+        return None
+    shift = (word >> 22) & 3
+    imm = (word >> 10) & 0xFFF
+    if shift == 1:
+        imm <<= 12
+    elif shift != 0:
+        return None
+    return word & 0x1F, (word >> 5) & 0x1F, imm
+
+
+def _aarch64_ldr64(word):
+    if (word & 0xFFC00000) != 0xF9400000:
+        return None
+    return word & 0x1F, (word >> 5) & 0x1F, ((word >> 10) & 0xFFF) * 8
+
+
+def _aarch64_str64(word):
+    if (word & 0xFFC00000) != 0xF9000000:
+        return None
+    return word & 0x1F, (word >> 5) & 0x1F, ((word >> 10) & 0xFFF) * 8
+
+
+def _aarch64_strh(word):
+    if (word & 0xFFC00000) != 0x79000000:
+        return None
+    return word & 0x1F, (word >> 5) & 0x1F, ((word >> 10) & 0xFFF) * 2
+
+
+def _aarch64_br(word):
+    if (word & 0xFFFFFC1F) != 0xD61F0000:
+        return None
+    return (word >> 5) & 0x1F
+
+
+def _aarch64_reg_address(blob, base, call_off, reg):
+    """Last adrp+add materialising an address in reg before call_off."""
+    ptr = _aarch64_pointer(blob, base, max(0, call_off - 12 * 4), call_off, reg)
+    if ptr is not None and ptr[0] == "rip":
+        return ptr[1]
+    return None
+
+
+def _aarch64_ldp_q(word):
+    """ldp/stp of a 128-bit pair. Returns (is_load, rt, rt2, rn, byte_off) or None."""
+    top = word & 0xFFC00000
+    if top not in (0xAD400000, 0xAD000000):
+        return None
+    imm7 = (word >> 15) & 0x7F
+    if imm7 & 0x40:
+        imm7 -= 0x80
+    return top == 0xAD400000, word & 31, (word >> 10) & 31, (word >> 5) & 31, imm7 * 16
+
+
+def _aarch64_ldur_q(word):
+    """ldur/stur of one 128-bit register. Returns (is_load, rt, rn, byte_off) or None."""
+    # Bit 22 is the load bit. Other variable fields are imm9, Rn and Rt.
+    if (word & 0xFFA00C00) != 0x3C800000:
+        return None
+    imm9 = (word >> 12) & 0x1FF
+    if imm9 & 0x100:
+        imm9 -= 0x200
+    return (word & 0x00400000) != 0, word & 31, (word >> 5) & 31, imm9
+
+
+def _aarch64_ldr_unsigned(word, scale, load_top, store_top):
+    """Unsigned ldr/str. Returns (is_load, rt, rn, byte_off) or None."""
+    top = word & 0xFFC00000
+    if top not in (load_top, store_top):
+        return None
+    imm = ((word >> 10) & 0xFFF) * scale
+    return top == load_top, word & 31, (word >> 5) & 31, imm
+
+
+def _aarch64_ldur_w(word):
+    """ldur/stur of a 32-bit register. Returns (is_load, rt, rn, byte_off) or None."""
+    if (word & 0xFFA00C00) != 0xB8000000:
+        return None
+    imm9 = (word >> 12) & 0x1FF
+    if imm9 & 0x100:
+        imm9 -= 0x200
+    return (word & 0x00400000) != 0, word & 31, (word >> 5) & 31, imm9
+
+
+def _aarch64_mov_wide(word):
+    """movz/movk into a 32-bit register. Returns (is_movk, rd, imm16, shift) or None."""
+    top = word & 0xFF800000
+    if top not in (0x52800000, 0x72800000):
+        return None
+    return top == 0x72800000, word & 31, (word >> 5) & 0xFFFF, ((word >> 21) & 3) * 16
+
+
+def _aarch64_pointer(blob, base, lo, hi, reg):
+    """Last pointer in reg: ('rip', va) or ('slot', sp_disp)."""
+    addr = {}
+    best = None
+    off = lo - (lo % 4)
+    while off + 4 <= hi:
+        word = int.from_bytes(blob[off:off + 4], "little")
+        adrp = _aarch64_adrp(word, base + off)
+        add = _aarch64_add_imm(word)
+        if adrp is not None and adrp[0] == reg:
+            addr[reg] = adrp[1]
+        elif add is not None and add[0] == reg and add[1] == reg and reg in addr:
+            best = (off, ("rip", addr[reg] + add[2]))
+            addr[reg] = addr[reg] + add[2]
+        elif add is not None and add[0] == reg and add[1] == 31:
+            best = (off, ("slot", add[2]))
+            addr.pop(reg, None)
+        off += 4
+    if best is None:
+        return None
+    return best[1]
+
+
+def _aarch64_stack_image(elf, blob, base, lo, hi):
+    """Bytes written through sp before hi. See _x86_stack_image."""
+    mem = {}
+    addr = {}
+    data = {}
+    qval = {}
+    # Register holds sp+offset. x31 is sp itself. GCC addresses the copy
+    # through `add x1, sp, #n` and then stp to x1, not to sp.
+    slot_of = {31: 0}
+    off = lo - (lo % 4)
+    limit = min(hi, len(blob) - 3)
+
+    def forget(reg):
+        addr.pop(reg, None)
+        data.pop(reg, None)
+        if reg != 31:
+            slot_of.pop(reg, None)
+
+    def write_q(disp, qreg):
+        src = qval.get(qreg)
+        if src is None:
+            return
+        raw = elf.bytes_at(src[0], src[1])
+        if raw:
+            _x86_write(mem, disp, raw)
+
+    def slot_base(reg):
+        return slot_of.get(reg)
+
+    while off + 4 <= limit:
+        word = int.from_bytes(blob[off:off + 4], "little")
+        pc = base + off
+        moved = _aarch64_mov_wide(word)
+        if moved is not None:
+            is_movk, rd, imm, shift = moved
+            if is_movk:
+                cur = data.get(rd, 0)
+                data[rd] = (cur & ~(0xFFFF << shift)) | (imm << shift)
+            else:
+                data[rd] = imm << shift
+            addr.pop(rd, None)
+            slot_of.pop(rd, None)
+            off += 4
+            continue
+        adrp = _aarch64_adrp(word, pc)
+        if adrp is not None:
+            addr[adrp[0]] = adrp[1]
+            data.pop(adrp[0], None)
+            slot_of.pop(adrp[0], None)
+            off += 4
+            continue
+        add = _aarch64_add_imm(word)
+        if add is not None and add[1] == 31:
+            slot_of[add[0]] = add[2]
+            addr.pop(add[0], None)
+            data.pop(add[0], None)
+            off += 4
+            continue
+        if add is not None and add[1] in addr:
+            addr[add[0]] = addr[add[1]] + add[2]
+            data.pop(add[0], None)
+            slot_of.pop(add[0], None)
+            off += 4
+            continue
+        if add is not None and add[1] in slot_of and add[1] != 31:
+            slot_of[add[0]] = slot_of[add[1]] + add[2]
+            addr.pop(add[0], None)
+            data.pop(add[0], None)
+            off += 4
+            continue
+        pair = _aarch64_ldp_q(word)
+        if pair is not None:
+            is_load, rt, rt2, rn, disp = pair
+            if is_load and rn in addr:
+                qval[rt] = (addr[rn] + disp, 16)
+                qval[rt2] = (addr[rn] + disp + 16, 16)
+            elif not is_load and rn in slot_of:
+                base_slot = slot_of[rn] + disp
+                write_q(base_slot, rt)
+                write_q(base_slot + 16, rt2)
+            off += 4
+            continue
+        qmem = _aarch64_ldur_q(word)
+        if qmem is not None:
+            is_load, rt, rn, disp = qmem
+            if is_load and rn in addr:
+                qval[rt] = (addr[rn] + disp, 16)
+            elif not is_load and rn in slot_of:
+                write_q(slot_of[rn] + disp, rt)
+            off += 4
+            continue
+        consumed = False
+        for scale, load_top, store_top, width in (
+            (4, 0xB9400000, 0xB9000000, 4),
+            (2, 0x79400000, 0x79000000, 2),
+        ):
+            memop = _aarch64_ldr_unsigned(word, scale, load_top, store_top)
+            if memop is None:
+                continue
+            is_load, rt, rn, disp = memop
+            if is_load and rn in addr:
+                raw = elf.bytes_at(addr[rn] + disp, width)
+                if raw and len(raw) == width:
+                    data[rt] = int.from_bytes(raw, "little")
+                forget(rt)
+            elif not is_load and rn in slot_of and rt in data:
+                _x86_write(mem, slot_of[rn] + disp, data[rt].to_bytes(width, "little"))
+            consumed = True
+            break
+        if consumed:
+            off += 4
+            continue
+        unscaled = _aarch64_ldur_w(word)
+        if unscaled is not None:
+            is_load, rt, rn, disp = unscaled
+            if is_load and rn in addr:
+                raw = elf.bytes_at(addr[rn] + disp, 4)
+                if raw and len(raw) == 4:
+                    data[rt] = int.from_bytes(raw, "little")
+                forget(rt)
+            elif not is_load and rn in slot_of and rt in data:
+                _x86_write(mem, slot_of[rn] + disp, data[rt].to_bytes(4, "little"))
+            off += 4
+            continue
+        # BL / B. Caller-saved state does not survive. sp is unchanged here
+        # (writeback forms are not this opcode).
+        if (word >> 26) in (0b100101, 0b000101):
+            addr.clear()
+            data.clear()
+            qval.clear()
+            slot_of = {31: 0}
+        off += 4
+    return mem
+
+
+def _aarch64_struct_modules(elf, blob, base, call_off):
+    lo = max(0, call_off - 48 * 4)
+    lo -= lo % 4
+    stores = []
+    words = []
+    off = lo
+    while off + 4 <= call_off:
+        word = int.from_bytes(blob[off:off + 4], "little")
+        store = _aarch64_str64(word)
+        if store is not None and store[1] in (31, 29):
+            stores.append((off, store[0], store[1], store[2]))
+        half = _aarch64_strh(word)
+        if half is not None and half[1] in (31, 29):
+            words.append((off, half[1], half[2]))
+        off += 4
+    best = None
+    for soff, reg, sbase, disp in stores:
+        if not any(
+            mbase == sbase and mdisp == disp + 8 and abs(moff - soff) < 48
+            for moff, mbase, mdisp in words
+        ):
+            continue
+        ptr = _aarch64_pointer(blob, base, max(0, soff - 32 * 4), soff, reg)
+        if ptr is None:
+            continue
+        if best is None or soff > best[0]:
+            best = (soff, ptr)
+    if best is None:
+        return set()
+    kind, val = best[1]
+    if kind == "rip":
+        module = _take_module(elf, val)
+    else:
+        pad = max(0, call_off - 0x2000)
+        pad -= pad % 4
+        image = _aarch64_stack_image(elf, blob, base, pad, call_off)
+        module = _module_from_stack(image, val)
+    return {module} if module else set()
+
+
+def _aarch64_call_modules(elf, blob, base, targets):
+    found = set()
+    limit = len(blob) - 3
+    off = 0
+    while off <= limit:
+        word = int.from_bytes(blob[off:off + 4], "little")
+        op = word >> 26
+        if op in (0b100101, 0b000101):  # BL, B
+            imm = word & 0x03FFFFFF
+            if imm & 0x02000000:
+                imm -= 0x04000000
+            kind = targets.get(base + off + imm * 4)
+            if kind in ("rdi", "rsi"):
+                reg = 0 if kind == "rdi" else 1
+                ptr = _aarch64_pointer(blob, base, max(0, off - 32 * 4), off, reg)
+                module = None
+                if ptr is not None and ptr[0] == "rip":
+                    module = _take_module(elf, ptr[1])
+                elif ptr is not None:
+                    pad = max(0, off - 0x2000)
+                    pad -= pad % 4
+                    image = _aarch64_stack_image(elf, blob, base, pad, off)
+                    module = _module_from_stack(image, ptr[1])
+                if module:
+                    found.add(module)
+            elif kind == "struct":
+                found.update(_aarch64_struct_modules(elf, blob, base, off))
+        off += 4
+    return found
+
+
+def may_have_cpp_qml(data):
+    # These are separate markers. A plugin can register or seal a module
+    # with one of them and never mention the others. qmlRegisterUncreatable
+    # covers qmlRegisterUncreatableMetaObject, which does not go through
+    # qmlregister.
+    return (
+        b"qml_register_types_" in data
+        or b"qmlRegisterModule" in data
+        or b"QQmlModuleRegistration" in data
+        or b"11qmlregister" in data
+        or b"qmlProtectModule" in data
+        or b"qmlRegisterUncreatable" in data
+        or b"qmlRegisterTypeNotAvailable" in data
+    )
+
+
+def cpp_qml_modules(data):
+    """Module URIs registered by C++ in this ELF. Unversioned names."""
+    if not data.startswith(b"\x7fELF") or not may_have_cpp_qml(data):
+        return set()
+    try:
+        elf = _Elf(data)
+        found = _symbol_modules(elf)
+        found.update(_modules_from_calls(elf))
+    except (ValueError, struct.error, IndexError, UnicodeError):
+        return set()
+    if DEBUG and found:
+        debug("c++ modules: " + " ".join(sorted(found)))
+    return found
+
+
+def deps_from_texts(texts, mode):
+    provides = []
+    requires = set()
+    for name, text in texts:
+        prov, req = provides_and_requires_from_text(name, text)
+        provides.extend(prov)
+        requires.update(req)
+    if mode == "provides":
+        return sorted(set(provides))
+    return sorted(f"qml({mod})" for mod in requires)
+
+
+def read_text_file(path):
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    return looks_like_text(raw)
+
+
+def deps_for_path(path, mode):
+    if mode == "requires" and os.environ.get("RPM_QML_REQUIRES") == "0":
+        return []
+    base = os.path.basename(path)
+    if base == "qmldir" or base.endswith(".qml"):
+        text = read_text_file(path)
+        if text is None:
+            return []
+        return deps_from_texts([(base, text)], mode)
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return []
+    if not data:
+        return []
+    elf = data.startswith(b"\x7fELF")
+    want_resource = (
+        data.startswith(b"qres")
+        or path.endswith(".rcc")
+        or (elf and QT_REGISTER in data)
+    )
+    want_cpp = mode == "provides" and elf and may_have_cpp_qml(data)
+    if not want_resource and not want_cpp:
+        return []
+    deps = deps_from_texts(extract_texts(path, data), mode) if want_resource else []
+    if want_cpp:
+        deps = sorted(set(deps).union(
+            f"qml({name})" for name in cpp_qml_modules(data)
+        ))
+    return deps
+
+
+def main(argv):
+    mode = None
+    multifile = False
+    dump = False
+    paths = []
+    for arg in argv:
+        if arg == "--provides":
+            mode = "provides"
+        elif arg == "--requires":
+            mode = "requires"
+        elif arg in ("--multifile", "-M"):
+            multifile = True
+        elif arg == "--dump":
+            dump = True
+        elif arg == "--":
+            continue
+        elif arg.startswith("-"):
+            print(f"qmldeps: unknown option {arg}", file=sys.stderr)
+            return 2
+        else:
+            paths.append(arg)
+    if mode is None and not dump:
+        print("qmldeps: need --provides or --requires", file=sys.stderr)
+        return 2
+    if not paths:
+        paths = [line.rstrip("\n") for line in sys.stdin if line.strip()]
+    status = 0
+    for path in paths:
+        try:
+            if dump:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                texts = []
+                base = os.path.basename(path)
+                if base == "qmldir" or base.endswith(".qml"):
+                    text = looks_like_text(data)
+                    if text is not None:
+                        texts = [(base, text)]
+                else:
+                    texts = extract_texts(path, data)
+                for name, text in texts:
+                    print(f"{path}: {name} ({len(text)} bytes)")
+                continue
+            deps = deps_for_path(path, mode)
+        except Exception as exc:
+            print(f"qmldeps: {path}: {exc}", file=sys.stderr)
+            status = 0
+            continue
+        if not deps:
+            continue
+        if multifile:
+            print(f";{path}")
+        for dep in deps:
+            print(dep)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

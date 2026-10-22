@@ -1,3 +1,9 @@
-%__qml_provides	%{_rpmconfigdir}/qml.prov
-%__qml_requires	%{_rpmconfigdir}/qml.req
-%__qml_path	^(.*/qmldir|.*\.qml)$
+# Loose QML modules and standalone Qt resource blobs.
+# multifile: one qmldeps process per package. Files with no deps are omitted.
+%__qml_provides	%{_rpmconfigdir}/qmldeps --provides --multifile
+%__qml_requires	%{_rpmconfigdir}/qmldeps --requires --multifile
+%__qml_protocol	multifile
+%__qml_path	^(.*/qmldir|.*\\.qml|.*\\.rcc)$
+# Qt Quick Designer helpers (HelperWidgets, StudioTheme, ...). Not a runtime
+# dependency, and nothing in the distro provides them.
+%__qml_exclude_path	/designer/
