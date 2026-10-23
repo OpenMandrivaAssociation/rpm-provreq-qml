@@ -1394,8 +1394,36 @@ def _x86_rsp_slots(blob, lo, hi):
         start = at + 1
 
 
-def _x86_last_pointer(blob, base, lo, hi, reg):
+def _x86_mov_rr(blob, lo, hi):
+    """Yield (off, dest, src) for `mov r64, r64`."""
+    start = lo
+    limit = min(hi, len(blob) - 2)
+    while start < limit:
+        rex = blob[start]
+        if 0x48 <= rex <= 0x4F and (rex & 0x08) and blob[start + 1] in (0x89, 0x8B):
+            modrm = blob[start + 2]
+            if (modrm >> 6) == 3:
+                regf = ((modrm >> 3) & 7) + (8 if rex & 4 else 0)
+                rmf = (modrm & 7) + (8 if rex & 1 else 0)
+                if blob[start + 1] == 0x89:
+                    dest, src = rmf, regf
+                else:
+                    dest, src = regf, rmf
+                if dest != src:
+                    yield start, dest, src
+                start += 3
+                continue
+        start += 1
+
+
+def _x86_last_pointer(blob, base, lo, hi, reg, depth=0):
     """Last value put in reg before hi: ('rip', va) or ('slot', rsp_disp)."""
+    # The value of rsp is the stack pointer. `mov rsi, rsp` encoded with
+    # opcode 8B does not match the rsp-slot scan, which only recognises 89.
+    if reg == 4:
+        return ("slot", 0)
+    if depth > 4 or lo >= hi:
+        return None
     best = None
     for off, lreg, target in _x86_rip_leas(blob[lo:hi], base + lo):
         if lreg != reg:
@@ -1408,12 +1436,30 @@ def _x86_last_pointer(blob, base, lo, hi, reg):
             continue
         if best is None or off > best[0]:
             best = (off, ("slot", slot))
+    # `lea rbx, [rsp+slot]; mov rsi, rbx` is how a stack URI reaches the
+    # argument register of qmlRegisterUncreatableMetaObject.
+    for off, dest, src in _x86_mov_rr(blob, lo, hi):
+        if dest != reg:
+            continue
+        if best is None or off > best[0]:
+            best = (off, ("from", src))
     if best is None:
         return None
-    return best[1]
+    kind = best[1]
+    if kind[0] == "from":
+        return _x86_last_pointer(blob, base, lo, best[0], kind[1], depth + 1)
+    return kind
 
 
-def _module_from_stack(image, slot):
+def _has_cstring(elf, text):
+    cached = elf.__dict__.get("_cstring_set")
+    if cached is None:
+        cached = {item for _off, item in _cstrings(elf.data)}
+        elf._cstring_set = cached
+    return text in cached
+
+
+def _module_from_stack(image, slot, elf=None):
     """NUL-terminated module name reconstructed at [rsp+slot]."""
     if not image:
         return None
@@ -1428,6 +1474,17 @@ def _module_from_stack(image, slot):
             return None
         chars.append(chr(byte))
         disp += 1
+    # Clang sometimes copies the bytes with movaps and terminates them with
+    # `movb %al, slot` after xorl %eax,%eax. If that one byte was missed, the
+    # captured run is still the module when the same literal is in the file.
+    text = "".join(chars)
+    if (
+        elf is not None
+        and len(text) >= 8
+        and plausible_module(text)
+        and _has_cstring(elf, text)
+    ):
+        return text
     return None
 
 
@@ -1439,7 +1496,7 @@ def _x86_write(mem, disp, raw):
 def _x86_sse_mov(blob, at, prefix, rex):
     """movaps/movups/movdqa/movdqu. Returns (is_load, reg, mode, disp, nbytes, next) or None.
 
-    `at` points at the 0F byte. mode is 'rip' or 'rsp'.
+    `at` points at the 0F byte. mode is 'rip', 'rsp', or a GPR number.
     """
     if at + 3 > len(blob):
         return None
@@ -1458,19 +1515,12 @@ def _x86_sse_mov(blob, at, prefix, rex):
     if mod == 0 and rm == 5 and at + 7 <= len(blob):
         disp = int.from_bytes(blob[at + 3:at + 7], "little", signed=True)
         return is_load, reg, "rip", disp, nbytes, at + 7
-    if rm == 4:
-        sib_at = at + 3
-        if sib_at >= len(blob) or blob[sib_at] != 0x24:
-            return None
-        if mod == 0 and sib_at + 1 <= len(blob):
-            return is_load, reg, "rsp", 0, nbytes, sib_at + 1
-        if mod == 1 and sib_at + 2 <= len(blob):
-            disp = int.from_bytes(blob[sib_at + 1:sib_at + 2], "little", signed=True)
-            return is_load, reg, "rsp", disp, nbytes, sib_at + 2
-        if mod == 2 and sib_at + 5 <= len(blob):
-            disp = int.from_bytes(blob[sib_at + 1:sib_at + 5], "little", signed=True)
-            return is_load, reg, "rsp", disp, nbytes, sib_at + 5
-    return None
+    mem = _x86_mem_op(blob, at + 2, rex or 0)
+    if mem is None:
+        return None
+    addr, disp, next_off = mem
+    mode = "rsp" if addr == 4 else addr
+    return is_load, reg, mode, disp, nbytes, next_off
 
 
 def _x86_vex_mov(blob, at):
@@ -1521,57 +1571,54 @@ def _x86_vex_mov(blob, at):
     if mod == 0 and rm == 5 and modrm_at + 5 <= len(blob):
         disp = int.from_bytes(blob[modrm_at + 1:modrm_at + 5], "little", signed=True)
         return is_load, reg, "rip", disp, nbytes, modrm_at + 5
-    if rm != 4 or rex_b:
+    mem = _x86_mem_op(blob, modrm_at, 1 if rex_b else 0)
+    if mem is None:
         return None
-    sib_at = modrm_at + 1
-    if sib_at >= len(blob) or blob[sib_at] != 0x24:
-        return None
-    if mod == 0:
-        return is_load, reg, "rsp", 0, nbytes, sib_at + 1
-    if mod == 1 and sib_at + 2 <= len(blob):
-        disp = int.from_bytes(blob[sib_at + 1:sib_at + 2], "little", signed=True)
-        return is_load, reg, "rsp", disp, nbytes, sib_at + 2
-    if mod == 2 and sib_at + 5 <= len(blob):
-        disp = int.from_bytes(blob[sib_at + 1:sib_at + 5], "little", signed=True)
-        return is_load, reg, "rsp", disp, nbytes, sib_at + 5
-    return None
+    addr, disp, next_off = mem
+    mode = "rsp" if addr == 4 else addr
+    return is_load, reg, mode, disp, nbytes, next_off
 
 
 def _x86_imm_store(blob, at):
-    """movl/movw/movb $imm, disp(%rsp). Returns (disp, raw, next) or None."""
-    if blob[at] == 0x66 and at + 3 < len(blob) and blob[at + 1] == 0xC7:
-        op = at + 1
+    """movl/movw/movb $imm to memory. Returns (base, disp, raw, next) or None.
+
+    base 4 is rsp. Clang also writes the tail of a stack URI through the
+    register that holds the array (`movl $imm, disp(%rax)` after
+    `lea rax, [rsp+slot]`).
+    """
+    if at >= len(blob):
+        return None
+    rex = 0
+    pos = at
+    if 0x40 <= blob[pos] <= 0x47:
+        rex = blob[pos]
+        pos += 1
+        if pos >= len(blob):
+            return None
+    if blob[pos] == 0x66 and pos + 1 < len(blob) and blob[pos + 1] == 0xC7:
         width = 2
-    elif blob[at] in (0xC6, 0xC7):
-        op = at
-        width = 1 if blob[at] == 0xC6 else 4
+        op = pos + 1
+    elif blob[pos] == 0xC6:
+        width = 1
+        op = pos
+    elif blob[pos] == 0xC7:
+        width = 4
+        op = pos
     else:
         return None
-    if op + 2 >= len(blob):
+    modrm_at = op + 1
+    if modrm_at >= len(blob):
         return None
-    modrm = blob[op + 1]
-    mod = modrm >> 6
-    reg = (modrm >> 3) & 7
-    rm = modrm & 7
-    if reg != 0 or rm != 4:
+    modrm = blob[modrm_at]
+    if ((modrm >> 3) & 7) != 0 or (modrm >> 6) == 3:
         return None
-    if mod == 0 and op + 3 + width <= len(blob) and blob[op + 2] == 0x24:
-        disp_at = op + 3
-        disp = 0
-        next_off = disp_at + width
-    elif mod == 1 and op + 4 + width <= len(blob) and blob[op + 2] == 0x24:
-        disp = int.from_bytes(blob[op + 3:op + 4], "little", signed=True)
-        disp_at = op + 4
-        next_off = disp_at + width
-    elif mod == 2 and op + 7 + width <= len(blob) and blob[op + 2] == 0x24:
-        disp = int.from_bytes(blob[op + 3:op + 7], "little", signed=True)
-        disp_at = op + 7
-        next_off = disp_at + width
-    else:
+    mem = _x86_mem_op(blob, modrm_at, rex)
+    if mem is None:
         return None
-    if next_off > len(blob):
+    base, disp, next_at = mem
+    if next_at + width > len(blob):
         return None
-    return disp, blob[disp_at:disp_at + width], next_off
+    return base, disp, blob[next_at:next_at + width], next_at + width
 
 
 def _x86_gpr_rip_load(blob, base, at):
@@ -1587,24 +1634,126 @@ def _x86_gpr_rip_load(blob, base, at):
 
 
 def _x86_gpr_rsp_store(blob, at):
-    """mov [rsp+disp], r64. Returns (reg, disp, next) or None. Not `mov reg, rsp`."""
-    if at + 3 > len(blob) or blob[at] not in (0x48, 0x4C) or blob[at + 1] != 0x89:
+    """mov to memory from a GPR. Returns (src, base, disp, next) or None.
+
+    Not `mov reg, rsp`. base 4 is rsp; another base is a frame register.
+    """
+    if at + 3 > len(blob) or not (0x48 <= blob[at] <= 0x4F) or (blob[at] & 0x08) == 0:
+        return None
+    if blob[at + 1] != 0x89:
         return None
     modrm = blob[at + 2]
-    mod = modrm >> 6
-    reg = ((modrm >> 3) & 7) + (8 if blob[at] & 4 else 0)
-    rm = modrm & 7
-    if mod == 3 or rm != 4:
+    if (modrm >> 6) == 3:
         return None
-    if mod == 0 and at + 4 <= len(blob) and blob[at + 3] == 0x24:
-        return reg, 0, at + 4
-    if mod == 1 and at + 5 <= len(blob) and blob[at + 3] == 0x24:
-        disp = int.from_bytes(blob[at + 4:at + 5], "little", signed=True)
-        return reg, disp, at + 5
-    if mod == 2 and at + 8 <= len(blob) and blob[at + 3] == 0x24:
-        disp = int.from_bytes(blob[at + 4:at + 8], "little", signed=True)
-        return reg, disp, at + 8
+    mem = _x86_mem_op(blob, at + 2, blob[at])
+    if mem is None:
+        return None
+    base, disp, next_at = mem
+    src = ((modrm >> 3) & 7) + (8 if blob[at] & 4 else 0)
+    return src, base, disp, next_at
+
+
+def _x86_slot_disp(mode, disp, defs, writes, blob, at):
+    """rsp displacement of a store, or None if the address is not a frame slot."""
+    if mode == "rip":
+        return None
+    if mode == "rsp" or mode == 4:
+        return disp
+    if isinstance(mode, int):
+        found = _x86_frame_base(defs, writes, blob, mode, at)
+        if found is not None and found[0] == 4:
+            return found[1] + disp
     return None
+
+
+def _x86_al_store(blob, at):
+    """movb %al, mem. Returns (base, disp, next) or None."""
+    rex = 0
+    op = at
+    if op < len(blob) and 0x40 <= blob[op] <= 0x43:
+        rex = blob[op]
+        op += 1
+    if op >= len(blob) or blob[op] != 0x88 or op + 1 >= len(blob):
+        return None
+    modrm = blob[op + 1]
+    if (modrm >> 6) == 3 or ((modrm >> 3) & 7) != 0:
+        return None
+    mem = _x86_mem_op(blob, op + 1, rex)
+    if mem is None:
+        return None
+    base, disp, next_at = mem
+    return base, disp, next_at
+
+
+def _x86_skip_preserving_rax(blob, at, hi):
+    """Next offset if this instruction cannot modify rax, else None."""
+    if at >= hi:
+        return None
+    store = _x86_al_store(blob, at)
+    if store is not None:
+        return store[2]
+    prefix = None
+    rex = None
+    op_at = None
+    if blob[at] in (0x66, 0xF2, 0xF3) and at + 1 < hi and blob[at + 1] == 0x0F:
+        prefix = blob[at]
+        op_at = at + 1
+    elif blob[at] in range(0x40, 0x50) and at + 1 < hi and blob[at + 1] == 0x0F:
+        rex = blob[at]
+        op_at = at + 1
+    elif blob[at] == 0x0F:
+        op_at = at
+    if op_at is None:
+        return None
+    sse = _x86_sse_mov(blob, op_at, prefix, rex)
+    if sse is not None:
+        return sse[5]
+    # xorps/xorpd. SIMD only; rax stays zero across the string copy.
+    if (
+        op_at + 2 < hi
+        and blob[op_at] == 0x0F
+        and blob[op_at + 1] in (0x57, 0xEF)
+        and (blob[op_at + 2] >> 6) == 3
+    ):
+        return op_at + 3
+    return None
+
+
+def _x86_zero_al_slots(blob, lo, hi, defs, writes):
+    """Slots where `movb %al, mem` stores a zero.
+
+    Clang terminates a movaps copy of `const char uri[]` with
+    `xorl %eax, %eax; movb %al, disp(%rsp)`. The NUL is not an immediate.
+    A zero is recorded only while every following instruction is one that
+    cannot change rax, so a `31 c0` inside an immediate does not invent NULs.
+    """
+    found_at = lo
+    limit = min(hi, len(blob))
+    while found_at < limit:
+        xor_a = blob.find(b"\x31\xc0", found_at, limit)
+        xor_b = blob.find(b"\x33\xc0", found_at, limit)
+        candidates = [item for item in (xor_a, xor_b) if item >= 0]
+        if not candidates:
+            break
+        at = min(candidates)
+        pos = at + 2
+        if pos < limit and _x86_skip_preserving_rax(blob, pos, limit) is None:
+            found_at = at + 1
+            continue
+        while pos < limit:
+            store = _x86_al_store(blob, pos)
+            if store is not None:
+                base, disp, nxt = store
+                slot = _x86_slot_disp(base, disp, defs, writes, blob, pos)
+                if slot is not None:
+                    yield slot
+                pos = nxt
+                continue
+            nxt = _x86_skip_preserving_rax(blob, pos, limit)
+            if nxt is None or nxt <= pos:
+                break
+            pos = nxt
+        found_at = at + 2
 
 
 def _x86_stack_image(elf, blob, base, lo, hi):
@@ -1613,10 +1762,13 @@ def _x86_stack_image(elf, blob, base, lo, hi):
     `const char uri[] = "module"` is a copy onto the stack. Clang keeps the
     literal in rodata and loads it; GCC on x86-64 splits it into 16-byte
     chunks plus an immediate tail, so the module name exists only once the
-    stores are replayed. Short names are often immediates alone.
+    stores are replayed. Short names are often immediates alone. Clang also
+    takes `lea rax, [rsp+slot]` and then stores through rax.
     """
     mem = {}
     loaded = {}
+    defs = _x86_frame_defs(blob, lo, hi)
+    writes = _x86_gpr_writes(blob, lo, hi)
     at = lo
     limit = min(hi, len(blob))
     while at < limit:
@@ -1638,12 +1790,13 @@ def _x86_stack_image(elf, blob, base, lo, hi):
                 is_load, reg, mode, disp, nbytes, next_off = sse
                 if is_load and mode == "rip":
                     loaded[("vec", reg)] = (base + op_at + 7 + disp, nbytes)
-                elif not is_load and mode == "rsp":
+                elif not is_load:
+                    slot = _x86_slot_disp(mode, disp, defs, writes, blob, op_at)
                     src = loaded.get(("vec", reg))
-                    if src is not None:
+                    if slot is not None and src is not None:
                         raw = elf.bytes_at(src[0], min(src[1], nbytes))
                         if raw:
-                            _x86_write(mem, disp, raw)
+                            _x86_write(mem, slot, raw)
                 at = next_off
                 continue
         if blob[at] in (0xC5, 0xC4):
@@ -1653,19 +1806,30 @@ def _x86_stack_image(elf, blob, base, lo, hi):
                 if is_load and mode == "rip":
                     # next_off is the end of the instruction, which is rip.
                     loaded[("vec", reg)] = (base + next_off + disp, nbytes)
-                elif not is_load and mode == "rsp":
+                elif not is_load:
+                    slot = _x86_slot_disp(mode, disp, defs, writes, blob, at)
                     src = loaded.get(("vec", reg))
-                    if src is not None:
+                    if slot is not None and src is not None:
                         raw = elf.bytes_at(src[0], min(src[1], nbytes))
                         if raw:
-                            _x86_write(mem, disp, raw)
+                            _x86_write(mem, slot, raw)
                 at = next_off
                 continue
-        if blob[at] == 0x66 or blob[at] in (0xC6, 0xC7):
+        if (
+            blob[at] == 0x66
+            or blob[at] in (0xC6, 0xC7)
+            or (
+                0x40 <= blob[at] <= 0x47
+                and at + 1 < limit
+                and blob[at + 1] in (0xC6, 0xC7, 0x66)
+            )
+        ):
             imm = _x86_imm_store(blob, at)
             if imm is not None:
-                disp, raw, next_off = imm
-                _x86_write(mem, disp, raw)
+                addr_base, disp, raw, next_off = imm
+                slot = _x86_slot_disp(addr_base, disp, defs, writes, blob, at)
+                if slot is not None:
+                    _x86_write(mem, slot, raw)
                 at = next_off
                 continue
         gpr = _x86_gpr_rip_load(blob, base, at)
@@ -1676,12 +1840,14 @@ def _x86_stack_image(elf, blob, base, lo, hi):
             continue
         store = _x86_gpr_rsp_store(blob, at)
         if store is not None:
-            reg, disp, next_off = store
-            src = loaded.get(("gpr", reg))
-            if src is not None:
-                raw = elf.bytes_at(src[0], min(src[1], 8))
-                if raw:
-                    _x86_write(mem, disp, raw)
+            reg, addr_base, disp, next_off = store
+            slot = _x86_slot_disp(addr_base, disp, defs, writes, blob, at)
+            if slot is not None:
+                src = loaded.get(("gpr", reg))
+                if src is not None:
+                    raw = elf.bytes_at(src[0], min(src[1], 8))
+                    if raw:
+                        _x86_write(mem, slot, raw)
             at = next_off
             continue
         if blob[at] == 0xE8 and at + 5 <= limit:
@@ -1689,6 +1855,11 @@ def _x86_stack_image(elf, blob, base, lo, hi):
             at += 5
             continue
         at += 1
+    for slot in _x86_zero_al_slots(blob, lo, hi, defs, writes):
+        # Only fill a terminator the other stores left out. A later real
+        # byte at this address stays.
+        if slot not in mem:
+            mem[slot] = 0
     return mem
 
 
@@ -1703,14 +1874,71 @@ def _x86_arg_module(elf, blob, base, call_off, reg, window):
     pad = blob.rfind(b"\xcc\xcc\xcc\xcc", max(0, call_off - 20000), call_off)
     start = pad + 4 if pad >= 0 else max(0, call_off - 0x2000)
     image = _x86_stack_image(elf, blob, base, start, call_off)
-    return _module_from_stack(image, ptr[1])
+    return _module_from_stack(image, ptr[1], elf)
 
 
-def _x86_reg_stores(blob, lo, hi):
-    """mov r64 -> disp8/32(%rsp or %rbp). Yields (off, src_reg, base_reg, disp)."""
+# rax, rcx, rdx, rsi, rdi, r8-r11. A call drops these; rbx, rbp and r12-r15 stay.
+_X86_CALLER_SAVED = {0, 1, 2, 6, 7, 8, 9, 10, 11}
+
+
+def _x86_mem_op(blob, modrm_at, rex):
+    """Memory operand of one instruction. Returns (base_reg, disp, next) or None.
+
+    base_reg is the architectural register (4 is rsp, 12 is r12, 5 is rbp).
+    A SIB index is rejected: the frame scanners only follow a plain base.
+    """
+    if modrm_at >= len(blob):
+        return None
+    modrm = blob[modrm_at]
+    mod = modrm >> 6
+    if mod == 3:
+        return None
+    rm_low = modrm & 7
+    pos = modrm_at + 1
+    if rm_low == 4:
+        if pos >= len(blob):
+            return None
+        sib = blob[pos]
+        pos += 1
+        # index field 4 with REX.X clear means "no index". Base field 4 is
+        # rsp, or r12 when REX.B is set. Any other SIB is an array address.
+        if ((sib >> 3) & 7) != 4 or (rex & 2) or (sib & 7) != 4:
+            return None
+        base = 12 if rex & 1 else 4
+    elif rm_low == 5 and mod == 0:
+        return None
+    else:
+        base = rm_low + (8 if rex & 1 else 0)
+    if mod == 0:
+        disp = 0
+    elif mod == 1:
+        if pos >= len(blob):
+            return None
+        disp = int.from_bytes(blob[pos:pos + 1], "little", signed=True)
+        pos += 1
+    elif mod == 2:
+        if pos + 4 > len(blob):
+            return None
+        disp = int.from_bytes(blob[pos:pos + 4], "little", signed=True)
+        pos += 4
+    else:
+        return None
+    return base, disp, pos
+
+
+def _x86_frame_defs(blob, lo, hi):
+    """Registers that hold rsp or rbp plus a displacement.
+
+    Clang -O2 does `lea r14, [rsp+0x70]` and then fills RegisterType through
+    r14. `mov r14, rsp` is the same idea with displacement 0. rbp is included
+    for builds that keep a frame pointer.
+    """
+    defs = {}
+    for off, reg, slot in _x86_rsp_slots(blob, lo, hi):
+        defs.setdefault(reg, []).append((off, 4, slot))
     start = lo
     while start < hi:
-        found = blob.find(b"\x89", start, hi)
+        found = blob.find(b"\x8d", start, hi)
         if found < 1:
             break
         rex = blob[found - 1]
@@ -1718,68 +1946,199 @@ def _x86_reg_stores(blob, lo, hi):
             start = found + 1
             continue
         modrm = blob[found + 1]
-        src = ((modrm >> 3) & 7) + (8 if rex & 4 else 0)
         mod = modrm >> 6
+        reg = ((modrm >> 3) & 7) + (8 if rex & 4 else 0)
         rm = modrm & 7
-        if mod == 1 and rm == 4 and found + 4 <= len(blob) and blob[found + 2] == 0x24:
-            disp = int.from_bytes(blob[found + 3:found + 4], "little", signed=True)
-            yield found - 1, src, 4, disp
-            start = found + 4
-            continue
-        if mod == 2 and rm == 4 and found + 7 <= len(blob) and blob[found + 2] == 0x24:
-            disp = int.from_bytes(blob[found + 3:found + 7], "little", signed=True)
-            yield found - 1, src, 4, disp
-            start = found + 7
-            continue
-        if mod == 1 and rm == 5 and found + 3 <= len(blob):
+        if rm == 5 and mod == 1 and found + 3 <= len(blob):
             disp = int.from_bytes(blob[found + 2:found + 3], "little", signed=True)
-            yield found - 1, src, 5, disp
+            defs.setdefault(reg, []).append((found - 1, 5, disp))
             start = found + 3
             continue
-        if mod == 2 and rm == 5 and found + 6 <= len(blob):
+        if rm == 5 and mod == 2 and found + 6 <= len(blob):
             disp = int.from_bytes(blob[found + 2:found + 6], "little", signed=True)
-            yield found - 1, src, 5, disp
+            defs.setdefault(reg, []).append((found - 1, 5, disp))
             start = found + 6
             continue
         start = found + 1
-
-
-def _x86_movw(blob, lo, hi):
-    """movw imm16 -> disp(%rsp or %rbp). Yields (off, base_reg, disp)."""
     start = lo
-    needle = b"\x66\xc7"
+    while start + 2 < hi:
+        rex = blob[start]
+        # mov reg, rbp. Source rbp means REX.R is clear and the reg field is 5.
+        if rex in (0x48, 0x49) and blob[start + 1] == 0x89:
+            modrm = blob[start + 2]
+            if (modrm >> 6) == 3 and ((modrm >> 3) & 7) == 5 and (rex & 4) == 0:
+                dest = (modrm & 7) + (8 if rex & 1 else 0)
+                defs.setdefault(dest, []).append((start, 5, 0))
+                start += 3
+                continue
+        start += 1
+    return defs
+
+
+def _x86_gpr_writes(blob, lo, hi):
+    """(offset, reg) for instructions that replace a GPR.
+
+    Used to drop a frame-pointer definition once the register is reused.
+    Missing a write can only create an extra provide, and the URI still has
+    to sit next to a version word, so this list is the writes compilers emit
+    while filling a QML registration struct.
+    """
+    writes = []
+    start = lo
+    limit = min(hi, len(blob) - 2)
+    while start < limit:
+        rex = blob[start]
+        if 0x48 <= rex <= 0x4F and (rex & 0x08):
+            opcode = blob[start + 1]
+            modrm = blob[start + 2]
+            mod = modrm >> 6
+            reg = ((modrm >> 3) & 7) + (8 if rex & 4 else 0)
+            rm = (modrm & 7) + (8 if rex & 1 else 0)
+            if opcode == 0x8B and mod == 3:
+                writes.append((start, reg))
+                start += 3
+                continue
+            if opcode == 0x89 and mod == 3:
+                writes.append((start, rm))
+                start += 3
+                continue
+            if opcode in (0x8B, 0x8D) and mod != 3:
+                writes.append((start, reg))
+            low = opcode - 0xB8
+            if 0 <= low <= 7:
+                writes.append((start, low + (8 if rex & 1 else 0)))
+                start += 10
+                continue
+        start += 1
+    return writes
+
+
+def _x86_frame_base(defs, writes, blob, reg, at):
+    """(frame_reg, disp) if reg still holds rsp/rbp+disp just before at."""
+    if reg in (4, 5):
+        return reg, 0
+    options = [item for item in defs.get(reg, ()) if item[0] < at]
+    kills = [off for off, written in writes if written == reg and off < at]
+    if not options:
+        return None
+    off, frame, disp = max(options)
+    if kills and max(kills) > off:
+        return None
+    if reg in _X86_CALLER_SAVED and blob.find(b"\xe8", off, at) >= 0:
+        return None
+    return frame, disp
+
+
+def _x86_reg_stores(blob, lo, hi, def_lo=None):
+    """mov r64 -> a stack slot. Yields (off, src_reg, frame_reg, disp).
+
+    The address may be disp(%rsp), disp(%rbp), or disp(%reg) where reg was
+    set from rsp or rbp (`lea r14, [rsp+0x70]`). Definitions are tracked from
+    def_lo so the lea can sit further back than the stores being reported.
+    """
+    defs = _x86_frame_defs(blob, lo if def_lo is None else def_lo, hi)
+    writes = _x86_gpr_writes(blob, lo if def_lo is None else def_lo, hi)
+    start = lo
     while start < hi:
-        found = blob.find(needle, start, hi)
-        if found < 0 or found + 4 > len(blob):
+        found = blob.find(b"\x89", start, hi)
+        if found < 1 or found + 2 > len(blob):
             break
-        modrm = blob[found + 2]
-        mod = modrm >> 6
-        reg = (modrm >> 3) & 7
-        rm = modrm & 7
-        if reg != 0:
+        rex = blob[found - 1]
+        if not (0x48 <= rex <= 0x4F) or (rex & 0x08) == 0:
             start = found + 1
             continue
-        if mod == 1 and rm == 4 and found + 7 <= len(blob) and blob[found + 3] == 0x24:
-            disp = int.from_bytes(blob[found + 4:found + 5], "little", signed=True)
-            yield found, 4, disp
-            start = found + 7
+        modrm = blob[found + 1]
+        if (modrm >> 6) == 3:
+            start = found + 1
             continue
-        if mod == 2 and rm == 4 and found + 10 <= len(blob) and blob[found + 3] == 0x24:
-            disp = int.from_bytes(blob[found + 4:found + 8], "little", signed=True)
-            yield found, 4, disp
-            start = found + 10
+        mem = _x86_mem_op(blob, found + 1, rex)
+        if mem is None:
+            start = found + 1
             continue
-        if mod == 1 and rm == 5 and found + 6 <= len(blob):
-            disp = int.from_bytes(blob[found + 3:found + 4], "little", signed=True)
-            yield found, 5, disp
-            start = found + 6
+        base, disp, next_at = mem
+        src = ((modrm >> 3) & 7) + (8 if rex & 4 else 0)
+        frame = _x86_frame_base(defs, writes, blob, base, found - 1)
+        if frame is None:
+            start = found + 1
             continue
-        if mod == 2 and rm == 5 and found + 9 <= len(blob):
-            disp = int.from_bytes(blob[found + 3:found + 7], "little", signed=True)
-            yield found, 5, disp
-            start = found + 9
+        yield found - 1, src, frame[0], frame[1] + disp
+        start = max(next_at, found + 1)
+
+
+def _x86_movw(blob, lo, hi, def_lo=None):
+    """A 16-bit store into a stack slot. Yields (off, frame_reg, disp).
+
+    QTypeRevision is a uint16, so the version next to a module URI is either
+    `movw $imm, slot` or `mov %reg16, slot`. Definitions are tracked from
+    def_lo, same as _x86_reg_stores.
+    """
+    defs = _x86_frame_defs(blob, lo if def_lo is None else def_lo, hi)
+    writes = _x86_gpr_writes(blob, lo if def_lo is None else def_lo, hi)
+
+    def frame_of(base, at):
+        found = _x86_frame_base(defs, writes, blob, base, at)
+        if found is None:
+            return None
+        return found
+
+    start = lo
+    while start < hi:
+        found = blob.find(b"\xc7", start, hi)
+        if found < 0 or found + 3 > len(blob):
+            break
+        prefix = found - 1
+        rex = 0
+        if prefix >= lo and 0x40 <= blob[prefix] <= 0x4F and (blob[prefix] & 0x08) == 0:
+            rex = blob[prefix]
+            prefix -= 1
+        if prefix < lo or blob[prefix] != 0x66:
+            start = found + 1
             continue
-        start = found + 1
+        modrm = blob[found + 1]
+        if ((modrm >> 3) & 7) != 0 or (modrm >> 6) == 3:
+            start = found + 1
+            continue
+        mem = _x86_mem_op(blob, found + 1, rex)
+        if mem is None:
+            start = found + 1
+            continue
+        base, disp, next_at = mem
+        frame = frame_of(base, prefix)
+        if frame is not None:
+            yield prefix, frame[0], frame[1] + disp
+        start = max(next_at, found + 1)
+
+    start = lo
+    while start + 2 < hi:
+        found = blob.find(b"\x89", start, hi)
+        if found < 1 or found + 2 > len(blob):
+            break
+        rex = 0
+        if blob[found - 1] == 0x66:
+            prefix = found - 1
+        elif (
+            found >= 2
+            and blob[found - 2] == 0x66
+            and 0x40 <= blob[found - 1] <= 0x47
+        ):
+            rex = blob[found - 1]
+            prefix = found - 2
+        else:
+            start = found + 1
+            continue
+        modrm = blob[found + 1]
+        if (modrm >> 6) == 3:
+            start = found + 1
+            continue
+        mem = _x86_mem_op(blob, found + 1, rex)
+        if mem is None:
+            start = found + 1
+            continue
+        base, disp, next_at = mem
+        frame = frame_of(base, prefix)
+        if frame is not None:
+            yield prefix, frame[0], frame[1] + disp
+        start = max(next_at, found + 1)
 
 
 def _x86_struct_modules(elf, blob, base, call_off):
@@ -1787,7 +2146,8 @@ def _x86_struct_modules(elf, blob, base, call_off):
 
     On the LP64 Qt 6 ABI the URI pointer is immediately followed by a
     QTypeRevision (uint16). Clang stores that pair as `mov reg, disp(%rsp)`
-    plus `movw imm, disp+8(%rsp)` next to the call. The register was loaded
+    plus `movw imm, disp+8(%rsp)`, or the same pair through a register that
+    holds the struct (`lea r14, [rsp+0x70]`). The URI register was loaded
     with `lea reg, [rip+uri]`.
     """
     pad = blob.rfind(b"\xcc\xcc\xcc\xcc", max(0, call_off - 20000), call_off)
@@ -1798,8 +2158,8 @@ def _x86_struct_modules(elf, blob, base, call_off):
     for off, reg, slot in _x86_rsp_slots(blob, start, call_off):
         leas.setdefault(reg, []).append((off, ("slot", slot)))
     window = max(start, call_off - 0x200)
-    stores = list(_x86_reg_stores(blob, window, call_off))
-    words = list(_x86_movw(blob, window, call_off))
+    stores = list(_x86_reg_stores(blob, window, call_off, start))
+    words = list(_x86_movw(blob, window, call_off, start))
     # One registration per call. Earlier calls in the same function leave
     # the same store/movw shape behind; only the fill closest to this call
     # belongs to it.
@@ -1825,7 +2185,7 @@ def _x86_struct_modules(elf, blob, base, call_off):
         module = _take_module(elf, val)
     else:
         image = _x86_stack_image(elf, blob, base, start, call_off)
-        module = _module_from_stack(image, val)
+        module = _module_from_stack(image, val, elf)
     return {module} if module else set()
 
 
@@ -1917,6 +2277,18 @@ def _aarch64_ldp_q(word):
     if imm7 & 0x40:
         imm7 -= 0x80
     return top == 0xAD400000, word & 31, (word >> 10) & 31, (word >> 5) & 31, imm7 * 16
+
+
+def _aarch64_ldr_q(word):
+    """Unsigned-offset ldr/str of one 128-bit register.
+
+    Returns (is_load, rt, rn, byte_off) or None. Clang copies a stack URI
+    with `ldr q0, [xN]; str q0, [xM]` rather than the unscaled form.
+    """
+    top = word & 0xFFC00000
+    if top not in (0x3DC00000, 0x3D800000):
+        return None
+    return top == 0x3DC00000, word & 31, (word >> 5) & 31, ((word >> 10) & 0xFFF) * 16
 
 
 def _aarch64_ldur_q(word):
@@ -2063,6 +2435,8 @@ def _aarch64_stack_image(elf, blob, base, lo, hi):
             off += 4
             continue
         qmem = _aarch64_ldur_q(word)
+        if qmem is None:
+            qmem = _aarch64_ldr_q(word)
         if qmem is not None:
             is_load, rt, rn, disp = qmem
             if is_load and rn in addr:
@@ -2075,6 +2449,7 @@ def _aarch64_stack_image(elf, blob, base, lo, hi):
         for scale, load_top, store_top, width in (
             (4, 0xB9400000, 0xB9000000, 4),
             (2, 0x79400000, 0x79000000, 2),
+            (1, 0x39400000, 0x39000000, 1),
         ):
             memop = _aarch64_ldr_unsigned(word, scale, load_top, store_top)
             if memop is None:
@@ -2085,6 +2460,9 @@ def _aarch64_stack_image(elf, blob, base, lo, hi):
                 if raw and len(raw) == width:
                     data[rt] = int.from_bytes(raw, "little")
                 forget(rt)
+            elif not is_load and rn in slot_of and rt == 31:
+                # wzr / xzr. Clang ends a stack copy with `strb wzr, [xN, #n]`.
+                _x86_write(mem, slot_of[rn] + disp, b"\0" * width)
             elif not is_load and rn in slot_of and rt in data:
                 _x86_write(mem, slot_of[rn] + disp, data[rt].to_bytes(width, "little"))
             consumed = True
@@ -2115,20 +2493,74 @@ def _aarch64_stack_image(elf, blob, base, lo, hi):
     return mem
 
 
+def _aarch64_gpr_dest(word):
+    """Register written by word, for instructions that replace a frame base.
+
+    Stores are excluded: str writes memory, and its Rt field is not a destination.
+    """
+    if (word >> 26) == 0b100101:  # BL clobbers x30
+        return 30
+    if (word & 0xFFC00000) in (
+        0xF9000000, 0xB9000000, 0x79000000, 0x39000000,
+    ):
+        return None
+    if (word & 0xFFC00000) in (0xF9400000, 0xB9400000, 0x79400000):
+        return word & 31
+    if (word & 0x9F000000) == 0x90000000:
+        return word & 31
+    if (word & 0xFF800000) in (0x52800000, 0x72800000, 0xD2800000, 0xF2800000):
+        return word & 31
+    if (word & 0xFF800000) in (0xD1000000, 0x51000000):
+        return word & 31
+    if (word & 0xFF200000) == 0xAA000000:
+        return word & 31
+    return None
+
+
+def _aarch64_frame_slot(slot_of, rn, disp):
+    """(frame_reg, disp) for an address that is still sp or fp relative."""
+    if rn in slot_of:
+        return 31, slot_of[rn] + disp
+    if rn in (31, 29):
+        return rn, disp
+    return None
+
+
 def _aarch64_struct_modules(elf, blob, base, call_off):
-    lo = max(0, call_off - 48 * 4)
+    lo = max(0, call_off - 96 * 4)
     lo -= lo % 4
+    # x31 is sp. `add xN, sp, #imm` is how clang addresses a stack struct.
+    slot_of = {31: 0}
     stores = []
     words = []
     off = lo
     while off + 4 <= call_off:
         word = int.from_bytes(blob[off:off + 4], "little")
+        add = _aarch64_add_imm(word)
+        if add is not None:
+            rd, rn, imm = add
+            if rd != 31 and (rn == 31 or rn in slot_of):
+                slot_of[rd] = (0 if rn == 31 else slot_of[rn]) + imm
+            elif rd != 31:
+                slot_of.pop(rd, None)
+        else:
+            written = _aarch64_gpr_dest(word)
+            if written is not None and written != 31:
+                slot_of.pop(written, None)
+            if (word >> 26) == 0b100101:
+                for reg in [reg for reg in slot_of if reg < 19]:
+                    slot_of.pop(reg, None)
+                slot_of[31] = 0
         store = _aarch64_str64(word)
-        if store is not None and store[1] in (31, 29):
-            stores.append((off, store[0], store[1], store[2]))
+        if store is not None:
+            resolved = _aarch64_frame_slot(slot_of, store[1], store[2])
+            if resolved is not None:
+                stores.append((off, store[0], resolved[0], resolved[1]))
         half = _aarch64_strh(word)
-        if half is not None and half[1] in (31, 29):
-            words.append((off, half[1], half[2]))
+        if half is not None:
+            resolved = _aarch64_frame_slot(slot_of, half[1], half[2])
+            if resolved is not None:
+                words.append((off, resolved[0], resolved[1]))
         off += 4
     best = None
     for soff, reg, sbase, disp in stores:
@@ -2151,7 +2583,7 @@ def _aarch64_struct_modules(elf, blob, base, call_off):
         pad = max(0, call_off - 0x2000)
         pad -= pad % 4
         image = _aarch64_stack_image(elf, blob, base, pad, call_off)
-        module = _module_from_stack(image, val)
+        module = _module_from_stack(image, val, elf)
     return {module} if module else set()
 
 
@@ -2177,7 +2609,7 @@ def _aarch64_call_modules(elf, blob, base, targets):
                     pad = max(0, off - 0x2000)
                     pad -= pad % 4
                     image = _aarch64_stack_image(elf, blob, base, pad, off)
-                    module = _module_from_stack(image, ptr[1])
+                    module = _module_from_stack(image, ptr[1], elf)
                 if module:
                     found.add(module)
             elif kind == "struct":

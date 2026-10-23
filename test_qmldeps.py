@@ -824,6 +824,179 @@ class CppProvideTests(unittest.TestCase):
         )
         self.assertEqual(qd.cpp_qml_modules(elf), {"Mod.New"})
 
+    def test_struct_addressed_through_lea_rsp(self):
+        # clang -O2 fills QQmlPrivate::RegisterType through a pointer
+        # register: lea r14, [rsp+0x70]; mov [r14+0x50], r15; movw [r14+0x58], 1.0
+        rodata = b"org.kde.plasma.kcm.users\0FingerprintModel\0"
+        text = bytearray()
+        cursor = 0x1000
+
+        def emit(blob):
+            nonlocal cursor
+            text.extend(blob)
+            cursor += len(blob)
+
+        emit(b"\x4c\x8d\x74\x24\x70")  # lea r14, [rsp+0x70]
+        emit(x86_lea_rip(cursor, 15, 0x2000))
+        emit(b"\x4d\x89\x7e\x50")  # mov [r14+0x50], r15
+        emit(b"\x66\x41\xc7\x46\x58\x00\x01")  # movw [r14+0x58], 0x100
+        emit(x86_call(cursor, 0x3000))
+        emit(b"\x4c\x8d\x74\x24\x70")
+        users = len(b"org.kde.plasma.kcm.users\0")
+        emit(x86_lea_rip(cursor, 0, 0x2000 + users))
+        emit(b"\x49\x89\x46\x50")  # mov [r14+0x50], rax
+        emit(b"\x66\x41\xc7\x46\x58\x00\x01")
+        emit(x86_call(cursor, 0x3000))
+        plt = x86_plt(0, 0x3000, 0x4000)
+        elf = elf_with(
+            EM_X86_64, bytes(text), rodata,
+            [("_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv", 0, 0)],
+            plt,
+        )
+        self.assertEqual(
+            qd.cpp_qml_modules(elf),
+            {"org.kde.plasma.kcm.users", "FingerprintModel"},
+        )
+
+    def test_struct_base_is_rsp_copied_into_a_register(self):
+        rodata = b"org.kde.private.kcms.nighttime\0"
+        text = bytearray()
+        cursor = 0x1000
+
+        def emit(blob):
+            nonlocal cursor
+            text.extend(blob)
+            cursor += len(blob)
+
+        emit(b"\x49\x89\xe6")  # mov r14, rsp
+        emit(x86_lea_rip(cursor, 15, 0x2000))
+        emit(b"\x4d\x89\x7e\x50")
+        # version in a register, not an immediate: mov %bp, [r14+0x58]
+        emit(b"\x66\x41\x89\x6e\x58")
+        emit(x86_call(cursor, 0x3000))
+        plt = x86_plt(0, 0x3000, 0x4000)
+        elf = elf_with(
+            EM_X86_64, bytes(text), rodata,
+            [("_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv", 0, 0)],
+            plt,
+        )
+        self.assertEqual(
+            qd.cpp_qml_modules(elf),
+            {"org.kde.private.kcms.nighttime"},
+        )
+
+    def test_reused_base_register_is_not_a_frame_pointer(self):
+        rodata = b"org.kde.plasma.kcm.users\0"
+        text = bytearray()
+        cursor = 0x1000
+
+        def emit(blob):
+            nonlocal cursor
+            text.extend(blob)
+            cursor += len(blob)
+
+        emit(b"\x4c\x8d\x74\x24\x70")  # lea r14, [rsp+0x70]
+        emit(b"\x4c\x8b\xf0")  # mov r14, rax; r14 no longer addresses the struct
+        emit(x86_lea_rip(cursor, 15, 0x2000))
+        emit(b"\x4d\x89\x7e\x50")
+        emit(b"\x66\x41\xc7\x46\x58\x00\x01")
+        emit(x86_call(cursor, 0x3000))
+        plt = x86_plt(0, 0x3000, 0x4000)
+        elf = elf_with(
+            EM_X86_64, bytes(text), rodata,
+            [("_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv", 0, 0)],
+            plt,
+        )
+        self.assertEqual(qd.cpp_qml_modules(elf), set())
+
+    def test_struct_uri_is_a_stack_array_addressed_by_a_register(self):
+        # clang copies `const char uri[]` through `lea rax, [rsp+slot]`
+        # and stores that pointer into RegisterType::uri.
+        raw = b"org.kde.private.kcms.notifications\0"
+        text = bytearray()
+        cursor = 0x1000
+
+        def emit(blob):
+            nonlocal cursor
+            text.extend(blob)
+            cursor += len(blob)
+
+        emit(b"\x0f\x28\x05" + struct.pack("<i", 0x2010 - (cursor + 7)))
+        emit(b"\x48\x8d\x44\x24\x40")  # lea rax, [rsp+0x40]
+        emit(b"\x0f\x29\x40\x10")  # movaps [rax+0x10], xmm0
+        emit(b"\x0f\x28\x05" + struct.pack("<i", 0x2000 - (cursor + 7)))
+        emit(b"\x0f\x29\x00")  # movaps [rax], xmm0
+        emit(b"\xc7\x40\x1f" + raw[31:35])
+        emit(b"\x4c\x8d\x74\x24\x70")  # lea r14, [rsp+0x70]
+        emit(b"\x49\x89\x46\x50")  # mov [r14+0x50], rax
+        emit(b"\x66\x41\xc7\x46\x58\x00\x01")
+        emit(x86_call(cursor, 0x3000))
+        plt = x86_plt(0, 0x3000, 0x4000)
+        elf = elf_with(
+            EM_X86_64, bytes(text), raw,
+            [("_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv", 0, 0)],
+            plt,
+        )
+        self.assertEqual(
+            qd.cpp_qml_modules(elf),
+            {"org.kde.private.kcms.notifications"},
+        )
+
+    def test_stack_array_terminated_by_movb_al(self):
+        # 16 bytes of payload and a separate `movb %al, slot` after xorl %eax,%eax.
+        # The rodata copy is not itself a C string, so the NUL has to be replayed.
+        name = b"org.kde.exampleX"
+        rodata = name + b"\xff"
+        text = bytearray()
+        cursor = 0x1000
+
+        def emit(blob):
+            nonlocal cursor
+            text.extend(blob)
+            cursor += len(blob)
+
+        emit(b"\x31\xc0")
+        emit(b"\x0f\x28\x05" + struct.pack("<i", 0x2000 - (cursor + 7)))
+        emit(b"\x0f\x29\x44\x24\x20")  # movaps [rsp+0x20], xmm0
+        emit(b"\x88\x44\x24\x30")  # movb %al, [rsp+0x30]
+        emit(b"\x48\x8d\x7c\x24\x20")  # lea rdi, [rsp+0x20]
+        emit(x86_call(cursor, 0x3000))
+        elf = self._protect_elf(bytes(text), rodata)
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.exampleX"})
+
+        # A write to eax between the xor and the movb means %al is not a NUL.
+        text = bytearray()
+        cursor = 0x1000
+
+        def emit2(blob):
+            nonlocal cursor
+            text.extend(blob)
+            cursor += len(blob)
+
+        emit2(b"\x31\xc0")
+        emit2(b"\xb8\x01\x00\x00\x00")
+        emit2(b"\x0f\x28\x05" + struct.pack("<i", 0x2000 - (cursor + 7)))
+        emit2(b"\x0f\x29\x44\x24\x20")
+        emit2(b"\x88\x44\x24\x30")
+        emit2(b"\x48\x8d\x7c\x24\x20")
+        emit2(x86_call(cursor, 0x3000))
+        elf = self._protect_elf(bytes(text), rodata)
+        self.assertEqual(qd.cpp_qml_modules(elf), set())
+
+    def test_metaobject_uri_copied_into_rsi(self):
+        text = (
+            b"\xc7\x44\x24\x10\x53\x4d\x41\x52"
+            b"\x66\xc7\x44\x24\x14\x54\x00"
+            b"\x48\x8d\x5c\x24\x10"  # lea rbx, [rsp+0x10]
+            b"\x48\x89\xde"  # mov rsi, rbx
+        )
+        at = 0x1000 + len(text)
+        text += x86_call(at, 0x3000)
+        plt = x86_plt(0, 0x3000, 0x4000)
+        sym = "_Z32qmlRegisterUncreatableMetaObjectRK11QMetaObjectPKciiS3_RK7QString"
+        elf = elf_with(EM_X86_64, text, b"QtQuick\0", [(sym, 0, 0)], plt)
+        self.assertEqual(qd.cpp_qml_modules(elf), {"SMART"})
+
     def test_requires_skip_cpp_modules(self):
         text = (
             b"\x66\xc7\x44\x24\x04\x54\x00"
@@ -895,6 +1068,67 @@ class CppProvideTests(unittest.TestCase):
             [(0x3100, 1)],
         )
         self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.example"})
+
+    def test_aarch64_struct_addressed_through_add_sp(self):
+        raw = b"org.kde.plasma.kcm.users\0"
+        words = [
+            0x9101C3E8,  # add x8, sp, #0x70
+            0xB0000001,  # adrp x1, 0x2000 (pc page is 0x1000)
+            0x91000021,  # add x1, x1, #0
+            0xF9002901,  # str x1, [x8, #0x50]
+            0x7900B102,  # strh w2, [x8, #0x58]
+        ]
+        bl_at = 0x1000 + 4 * len(words)
+        words.append(0x94000000 | (((0x3000 - bl_at) >> 2) & 0x03FFFFFF))
+        text = b"".join(word.to_bytes(4, "little") for word in words)
+        plt = (0x90000010).to_bytes(4, "little")
+        plt += (0xF9408211).to_bytes(4, "little")
+        plt += (0xD61F0220).to_bytes(4, "little")
+        plt += (0xD503201F).to_bytes(4, "little")
+        elf = build_elf(
+            EM_AARCH64,
+            [
+                (".text", SHT_PROGBITS, 6, 0x1000, 0, text),
+                (".rodata", SHT_PROGBITS, 2, 0x2000, 0, raw),
+                (".plt", SHT_PROGBITS, 6, 0x3000, 0, plt),
+            ],
+            [("_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv", 0, 0)],
+            [(0x3100, 1)],
+        )
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.plasma.kcm.users"})
+
+    def test_aarch64_struct_uri_copied_with_q_register(self):
+        # 16 payload bytes, then strb wzr. The rodata is not a C string.
+        raw = b"org.kde.exampleX\xff"
+        words = [
+            0x910103E8,  # add x8, sp, #0x40
+            0xB0000001,  # adrp x1, 0x2000
+            0x91000021,  # add x1, x1, #0
+            0x3DC00020,  # ldr q0, [x1]
+            0x3D800100,  # str q0, [x8]
+            0x3900411F,  # strb wzr, [x8, #16]
+            0x9101C3E9,  # add x9, sp, #0x70
+            0xF9002928,  # str x8, [x9, #0x50]
+            0x7900B122,  # strh w2, [x9, #0x58]
+        ]
+        bl_at = 0x1000 + 4 * len(words)
+        words.append(0x94000000 | (((0x3000 - bl_at) >> 2) & 0x03FFFFFF))
+        text = b"".join(word.to_bytes(4, "little") for word in words)
+        plt = (0x90000010).to_bytes(4, "little")
+        plt += (0xF9408211).to_bytes(4, "little")
+        plt += (0xD61F0220).to_bytes(4, "little")
+        plt += (0xD503201F).to_bytes(4, "little")
+        elf = build_elf(
+            EM_AARCH64,
+            [
+                (".text", SHT_PROGBITS, 6, 0x1000, 0, text),
+                (".rodata", SHT_PROGBITS, 2, 0x2000, 0, raw),
+                (".plt", SHT_PROGBITS, 6, 0x3000, 0, plt),
+            ],
+            [("_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv", 0, 0)],
+            [(0x3100, 1)],
+        )
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.exampleX"})
 
 
 class InstalledCppTests(unittest.TestCase):
