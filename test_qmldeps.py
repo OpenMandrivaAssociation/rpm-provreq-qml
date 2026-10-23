@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Tests for the QML Provides/Requires generator."""
 
+import base64
 import ctypes
 import importlib.machinery
 import importlib.util
@@ -497,6 +498,8 @@ SHT_RELA = 4
 SHT_DYNSYM = 11
 EM_X86_64 = 62
 EM_AARCH64 = 183
+EM_RISCV = 243
+EM_LOONGARCH = 258
 
 
 def _strtab(strings):
@@ -510,12 +513,13 @@ def _strtab(strings):
     return bytes(blob), offsets
 
 
-def build_elf(machine, parts, symbols, relas=None):
+def build_elf(machine, parts, symbols, relas=None, relatives=None):
     """Tiny ELF64 shared object.
 
     parts: (name, type, flags, addr, entsize, data)
     symbols: (name, value, shndx) after the null symbol. shndx 0 is undefined.
     relas: (got_addr, symbol_index) with symbol_index 1-based.
+    relatives: (vaddr, addend) R_*_RELATIVE entries, type 3.
     """
     dynstr, dynoff = _strtab([name for name, _value, _shndx in symbols])
     dynsym = [struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0)]
@@ -531,6 +535,11 @@ def build_elf(machine, parts, symbols, relas=None):
     items.append((".dynsym", SHT_DYNSYM, 0, 0, 24, b"".join(dynsym)))
     if relas:
         items.append((".rela.plt", SHT_RELA, 0, 0, 24, rela))
+    if relatives:
+        rela_dyn = b"".join(
+            struct.pack("<QQq", off, 3, addend) for off, addend in relatives
+        )
+        items.append((".rela.dyn", SHT_RELA, 0, 0, 24, rela_dyn))
     shstr, nameoff = _strtab([name for name, *_rest in items] + [".shstrtab"])
     items.append((".shstrtab", SHT_STRTAB, 0, 0, 0, shstr))
     blob = bytearray(64)
@@ -1282,6 +1291,326 @@ class CppProvideTests(unittest.TestCase):
         ]
         elf = aarch64_register_elf(words, raw)
         self.assertEqual(qd.cpp_qml_modules(elf), set())
+
+
+QMLREGISTER = "_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv"
+QMLPROTECT = "_Z16qmlProtectModulePKci"
+QMLUNCREATABLE = (
+    "_Z32qmlRegisterUncreatableMetaObjectRK11QMetaObjectPKciiS3_RK7QString"
+)
+
+
+def u32s(*words):
+    return b"".join((word & 0xFFFFFFFF).to_bytes(4, "little") for word in words)
+
+
+def rv_auipc(rd, imm20):
+    return ((imm20 & 0xFFFFF) << 12) | (rd << 7) | 0x17
+
+
+def rv_addi(rd, rs, imm):
+    return ((imm & 0xFFF) << 20) | (rs << 15) | (rd << 7) | 0x13
+
+
+def rv_jal(rd, disp):
+    word = (rd << 7) | 0x6F
+    word |= ((disp >> 20) & 1) << 31
+    word |= ((disp >> 1) & 0x3FF) << 21
+    word |= ((disp >> 11) & 1) << 20
+    word |= ((disp >> 12) & 0xFF) << 12
+    return word
+
+
+def rv_ld(rd, rs, imm):
+    return ((imm & 0xFFF) << 20) | (rs << 15) | (3 << 12) | (rd << 7) | 0x03
+
+
+def rv_store(funct3, rs2, rs1, imm):
+    imm &= 0xFFF
+    return (
+        ((imm >> 5) << 25)
+        | (rs2 << 20)
+        | (rs1 << 15)
+        | (funct3 << 12)
+        | ((imm & 0x1F) << 7)
+        | 0x23
+    )
+
+
+def rv_plt(stub, got):
+    delta = got - stub
+    hi, lo = delta >> 12, delta & 0xFFF
+    return u32s(rv_auipc(28, hi), rv_ld(28, 28, lo), (28 << 15) | (6 << 7) | 0x67, 0x13)
+
+
+def la_2ri12(op, si12, rj, rd):
+    return (op << 22) | ((si12 & 0xFFF) << 10) | (rj << 5) | rd
+
+
+def la_pcrel(op7, si20, rd):
+    return (op7 << 25) | ((si20 & 0xFFFFF) << 5) | rd
+
+
+def la_bl(disp):
+    imm = (disp >> 2) & 0x3FFFFFF
+    low = ((imm & 0xFFFF) << 10) | ((imm >> 16) & 0x3FF)
+    return (0x15 << 26) | low
+
+
+def la_plt(stub, got):
+    delta = got - stub
+    si20, si12 = delta >> 12, delta & 0xFFF
+    return u32s(
+        la_pcrel(0x0E, si20, 15),
+        la_2ri12(0x0A3, si12, 15, 15),
+        la_2ri12(0x130, 0, 15, 13),
+        0x03400000,
+    )
+
+
+def port_elf(machine, text, rodata, plt, symbols, relatives=None, extra=()):
+    """ELF with one 16-byte PLT stub per symbol. GOT slots start at 0x3100."""
+    parts = [(".text", SHT_PROGBITS, 6, 0x1000, 0, text)]
+    if rodata:
+        parts.append((".rodata", SHT_PROGBITS, 2, 0x2000, 0, rodata))
+    parts.extend(extra)
+    parts.append((".plt", SHT_PROGBITS, 6, 0x3000, 0, plt))
+    relas = [(0x3100 + 8 * i, i + 1) for i in range(len(symbols))]
+    return build_elf(machine, parts, [(name, 0, 0) for name in symbols], relas, relatives)
+
+
+def _unpack_fixture(text):
+    raw = zlib.decompress(base64.b64decode(text))
+    out = {}
+    pos = 0
+    for name in (".text", ".rodata", ".data.rel.ro", ".plt"):
+        addr, size = struct.unpack_from("<QI", raw, pos)
+        pos += 12
+        out[name] = (addr, raw[pos:pos + size])
+        pos += size
+    return out
+
+
+# Clang -O2 -fPIC -shared -nostdlib output for the registration fixture.
+# Text, rodata, the relocated RegisterType image and the PLT, at the
+# original virtual addresses. Compressed RISC-V and the LoongArch vector
+# copy are in here; the synthetic tests above use only the 32-bit forms.
+_RV_FIXTURE = (
+    "eNrFUEFr02AYftMsWZFaM7OS7TaMSi36HSrrURBJPYiClB2FZu3XEpombZOJu60t7UGkCD30OgR38NCDOI8y"
+    "UX+CF9mhG+2oUO0OUxQc3ZtmLSM38eAHDx/P+zzf877f+0yC8VllAFaK9V4rBNCscUt+QeQ3zg1hSQoIjDKETUlC"
+    "ReR64YAq0HnNnyedaDfWjwye1sZ6SPoxGonc50EN2c4p632tKUx8wqWfo1GT4w7E2YMBp3Dxcrx8dwgQaic1tbIR"
+    "Kta/Oa7WqbOFYGNbnerbzB67/HK/ut3bl/1MIPY7etzee9ULgzNhGbt15s4rgUWRByHysd2R59/PXAdnpmTge/IG"
+    "Jj8q1rtnk6vbn76wMX6XXeZ2o0fkV+SPDMwM+oP43wthocmB4OtG+mQgC4xPnkNcRIiMz83t8GHB+WVydiupYv56"
+    "kT9yt8MtTrfTjfZjg8ih+2KHfVFQ0LnAu9t+g1izaClDabpQ0h6rNiWraipHcqm8WcqSXJqSnGqkUdexZBHdNCf1g"
+    "q5aedVxEifCggemrWW0lGprppGgtq0ZWQsmbvpEzRd0CnGs0hL2Muz7ZprqU8Ok/biNcSbKghWMh4f36HqCFteok"
+    "aLw/Jo7fx/Bwj8eBv7PYf5OP1xw701ESwa4yX64zb6rXhXZO8fNCt4JEaqvK5CFIEgE93KrcSXLBkFEv8uDHt647"
+    "NE9vCF7dA9vXPLoU34Cs8nqCw=="
+)
+_LA_FIXTURE = (
+    "eNrFUr+L1EAUfjPJrisc/ijEn0UOLBII+zfMKYrgKRwXwcIiYzJ7F3Y3WTc50W5OduWKK/0Dst0Vbm8jzHrN"
+    "LRzYqYXFihY2YiOoILfOJPvjDNeIhQ8ek2++773v8Sa8jEDFC3l4/Bem7q51GcOFLv+IfSFwOX2iwR5ymPzW4QzA"
+    "PnL0s5VznIC9CWC7nNiUEJuRCf9c8gfji533b3FJ59oM381xWWl28rtu+garc2v9HdYVJ/OY5I8rzTPkyFlMj+9i"
+    "A2AZgGgqZzP+/H6+y8GczsGIZrlw1abiiu0b+dwl1eee9Frgmm9wyxevsA8DS4eOxEsWMyYz/4AjvWae4gBTY2B1"
+    "vklPF8ynRJhceQKyaiNhuSmxQUcOnEKOawjLTwX2ich9XGK561LDxdxvCxylyfazLb2NgemRQebtkTGmqbA+LRza"
+    "sSt3bMgdT+tvyJpUmJ58E1WzU8qeEIYyo/Zate6zaqtB4yat1r1mdSNm7RhuR0lQCzyaBFG4ypIkCNfimZo9os1W"
+    "g8F1ecvarXYQJrcinzXm7drBQ5ow1S+uhodaxXBHtoeVm+zxKnuwwUKPZbNMC5V5jTH/PvXqqhomcWTjRhTVaehL"
+    "fQNGFZwJP8vU4B8Dwf8J9Hc8qeQXqcwTOlzqvzwNr3tDs78yxvu9Ie6XrsH2ojBHCJZPSv4rHZpfUP7DZnipgBcL"
+    "GBXwh70/8aCAewW8Oce/AR1w8fs="
+)
+
+
+class RiscvLoongarchTests(unittest.TestCase):
+    """Call scanners for the in-progress riscv64 and loongarch64 ports."""
+
+    def test_branch_immediates_roundtrip(self):
+        self.assertEqual(qd._rv_jal_imm(rv_jal(1, 0x172)), 0x172)
+        self.assertEqual(qd._rv_jal_imm(rv_jal(1, -8)), -8)
+        self.assertEqual(qd._larch_i26(la_bl(456)), 456)
+        self.assertEqual(qd._larch_i26(la_bl(-456)), -456)
+        self.assertEqual(qd._larch_i26(la_bl(131072)), 131072)
+        self.assertEqual(qd._larch_i26(la_bl(-131072)), -131072)
+
+    def test_riscv_protect_module_from_auipc(self):
+        text = u32s(rv_auipc(10, 1), rv_addi(10, 10, 0), rv_jal(1, 0x3000 - 0x1008))
+        elf = port_elf(EM_RISCV, text, b"org.kde.example\0", rv_plt(0x3000, 0x3100), [QMLPROTECT])
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.example"})
+
+    def test_riscv_stack_uri_is_captured_before_the_register_is_reused(self):
+        text = u32s(
+            rv_auipc(10, 1),
+            rv_addi(10, 10, 0),
+            rv_ld(11, 10, 0),
+            rv_ld(12, 10, 8),
+            rv_store(3, 11, 2, 0x20),
+            rv_store(3, 12, 2, 0x28),
+            rv_addi(11, 2, 0x20),
+            rv_store(3, 11, 2, 0x40),
+            rv_addi(12, 0, 0x100),
+            rv_store(1, 12, 2, 0x48),
+            rv_addi(11, 2, 8),
+            rv_addi(10, 0, 0),
+            rv_jal(1, 0x3000 - 0x1030),
+        )
+        elf = port_elf(
+            EM_RISCV, text, b"org.kde.example\0", rv_plt(0x3000, 0x3100), [QMLREGISTER]
+        )
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.example"})
+
+    def test_riscv_uncreatable_reads_the_uri_not_the_type_name(self):
+        text = u32s(
+            rv_auipc(10, 1),
+            rv_addi(11, 10, 0),
+            rv_addi(14, 10, 25),
+            rv_addi(10, 0, 1),
+            rv_jal(1, 0x3000 - 0x1010),
+        )
+        ro = b"org.kde.plasma.kcm.users\0User\0"
+        elf = port_elf(EM_RISCV, text, ro, rv_plt(0x3000, 0x3100), [QMLUNCREATABLE])
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.plasma.kcm.users"})
+
+    def test_riscv_memcpy_image_skips_a_metaobject_name(self):
+        note = b"org.kde.private.kcms.notifications\0"
+        meta = b"NotificationSettings\0"
+        image = bytearray(0x60)
+        image[0:4] = (3).to_bytes(4, "little")
+        image[0x40:0x48] = (0x100).to_bytes(8, "little")
+        text = u32s(
+            rv_auipc(11, 3),
+            rv_addi(11, 11, 0),
+            rv_addi(10, 2, 0x20),
+            rv_addi(12, 0, 0x60),
+            rv_jal(1, 0x3000 - 0x1010),
+            rv_addi(11, 2, 0x20),
+            rv_addi(10, 0, 0),
+            rv_jal(1, 0x3010 - 0x101C),
+        )
+        plt = rv_plt(0x3000, 0x3100) + rv_plt(0x3010, 0x3108)
+        elf = port_elf(
+            EM_RISCV,
+            text,
+            note + meta,
+            plt,
+            ["memcpy", QMLREGISTER],
+            [(0x4038, 0x2000), (0x4048, 0x2000 + len(note))],
+            extra=[(".data.rel.ro", SHT_PROGBITS, 2, 0x4000, 0, bytes(image))],
+        )
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.private.kcms.notifications"})
+
+    def test_loongarch_protect_module_from_pcalau12i(self):
+        text = u32s(la_pcrel(0x0D, 1, 4), la_2ri12(0x00B, 0, 4, 4), la_bl(0x3000 - 0x1008))
+        elf = port_elf(EM_LOONGARCH, text, b"org.kde.example\0", la_plt(0x3000, 0x3100), [QMLPROTECT])
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.example"})
+
+    def test_loongarch_stack_uri_paired_with_sth(self):
+        text = u32s(
+            la_pcrel(0x0D, 1, 4),
+            la_2ri12(0x00B, 0, 4, 4),
+            la_2ri12(0x0A3, 0, 4, 5),
+            la_2ri12(0x0A3, 8, 4, 6),
+            la_2ri12(0x0A7, 0x20, 3, 5),
+            la_2ri12(0x0A7, 0x28, 3, 6),
+            la_2ri12(0x00B, 0x20, 3, 4),
+            la_2ri12(0x0A7, 0x40, 3, 4),
+            la_2ri12(0x00E, 0x100, 0, 4),
+            la_2ri12(0x0A5, 0x48, 3, 4),
+            la_2ri12(0x00B, 8, 3, 5),
+            (0x2A << 15) | 4,
+            la_bl(0x3000 - 0x1030),
+        )
+        elf = port_elf(
+            EM_LOONGARCH, text, b"org.kde.example\0", la_plt(0x3000, 0x3100), [QMLREGISTER]
+        )
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.example"})
+
+    def test_loongarch_uncreatable_keeps_a1_after_a0_is_overwritten(self):
+        text = u32s(
+            la_pcrel(0x0D, 1, 4),
+            la_2ri12(0x00B, 0, 4, 5),
+            la_2ri12(0x00B, 25, 4, 8),
+            la_2ri12(0x00E, 1, 0, 4),
+            la_bl(0x3000 - 0x1010),
+        )
+        ro = b"org.kde.plasma.kcm.users\0User\0"
+        elf = port_elf(EM_LOONGARCH, text, ro, la_plt(0x3000, 0x3100), [QMLUNCREATABLE])
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.plasma.kcm.users"})
+
+    def test_loongarch_vector_copy_skips_a_metaobject_name(self):
+        note = b"org.kde.private.kcms.notifications\0"
+        meta = b"NotificationSettings\0"
+        image = bytearray(32)
+        image[16:24] = (0x100).to_bytes(8, "little")
+        text = u32s(
+            la_pcrel(0x0C, 0xC00, 4),
+            la_2ri12(0x0B0, 0, 4, 0),
+            la_2ri12(0x0B0, 16, 4, 1),
+            la_2ri12(0x0B1, 0x10, 3, 0),
+            la_2ri12(0x0B1, 0x20, 3, 1),
+            la_2ri12(0x00B, 0x10, 3, 5),
+            (0x2A << 15) | 4,
+            la_bl(0x3000 - 0x101C),
+        )
+        elf = port_elf(
+            EM_LOONGARCH,
+            text,
+            note + meta,
+            la_plt(0x3000, 0x3100),
+            [QMLREGISTER],
+            [(0x4000, 0x2000 + len(note)), (0x4008, 0x2000)],
+            extra=[(".data.rel.ro", SHT_PROGBITS, 2, 0x4000, 0, bytes(image))],
+        )
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.private.kcms.notifications"})
+
+    def test_clang_fixtures_provide_registered_modules_only(self):
+        expect = {
+            "FingerprintModel",
+            "QKeySequence",
+            "org.kde.example",
+            "org.kde.plasma.kcm.users",
+            "org.kde.private.kcms.lookandfeel",
+            "org.kde.private.kcms.notifications",
+            "org.kde.userfeedback.kcm",
+        }
+        cases = (
+            (
+                EM_RISCV,
+                _RV_FIXTURE,
+                [
+                    (0x3B68, 1), (0x3B70, 2), (0x3B78, 3), (0x3B80, 4),
+                    (0x3B88, 5), (0x3B90, 6), (0x3B98, 7), (0x3BA0, 8),
+                ],
+                [
+                    (0x29C8, 0x697), (0x29D8, 0x661), (0x2A40, 0x686),
+                    (0x2A50, 0x686), (0x2A60, 0x6BF),
+                ],
+            ),
+            (
+                EM_LOONGARCH,
+                _LA_FIXTURE,
+                [
+                    (0x30AB8, 1), (0x30AC0, 2), (0x30AC8, 3), (0x30AD0, 4),
+                    (0x30AD8, 5), (0x30AE0, 6), (0x30AE8, 7), (0x30AF0, 8),
+                ],
+                [
+                    (0x20918, 0x5F7), (0x20928, 0x5C1), (0x20990, 0x5E6),
+                    (0x209A0, 0x5E6), (0x209B0, 0x61F),
+                ],
+            ),
+        )
+        symbols = [
+            "memcpy", "qmlregister", "qmlProtectModule", "qmlRegisterModule",
+            "qmlRegisterUncreatableMetaObject", "memset", "make_object", "touch",
+        ]
+        for machine, packed, relas, relatives in cases:
+            secs = _unpack_fixture(packed)
+            parts = [
+                (name, SHT_PROGBITS, 6 if name in (".text", ".plt") else 2, addr, 0, blob)
+                for name, (addr, blob) in secs.items()
+            ]
+            elf = build_elf(machine, parts, [(name, 0, 0) for name in symbols], relas, relatives)
+            found = qd.cpp_qml_modules(elf)
+            self.assertEqual(found, expect)
+            self.assertNotIn("NotificationSettings", found)
+            self.assertNotIn("User", found)
 
 
 class InstalledCppTests(unittest.TestCase):

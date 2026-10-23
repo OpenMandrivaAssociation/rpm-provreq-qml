@@ -1147,22 +1147,37 @@ class _Elf:
 def _registration_kind(name):
     """How a Qt registration import passes the module URI."""
     base = name.split(b"@", 1)[0]
-    if base == b"_Z17qmlRegisterModulePKcii":
+    # C++ linkage is the mangled form Qt exports. A C declaration of the
+    # same function imports the plain name; the URI register is unchanged.
+    if base in (b"qmlRegisterModule", b"_Z17qmlRegisterModulePKcii"):
         return "rdi"  # qmlRegisterModule(uri, major, minor)
     # Seals a module this object just registered types into. The URI is the
     # module name. qmlRegisterModuleImport is not here: that is a dependency.
-    if base == b"_Z16qmlProtectModulePKci":
+    if base in (b"qmlProtectModule", b"_Z16qmlProtectModulePKci"):
         return "rdi"
-    if base == b"_Z27qmlRegisterTypeNotAvailablePKciiS0_RK7QString":
+    if base in (
+        b"qmlRegisterTypeNotAvailable",
+        b"_Z27qmlRegisterTypeNotAvailablePKciiS0_RK7QString",
+    ):
         return "rdi"
     if base.startswith(b"_ZN22QQmlModuleRegistrationC1EPKc") or base.startswith(
         b"_ZN22QQmlModuleRegistrationC2EPKc"
     ):
         return "rsi"  # (this, uri, ...)
-    if base == b"_Z32qmlRegisterUncreatableMetaObjectRK11QMetaObjectPKciiS3_RK7QString":
+    if base in (
+        b"qmlRegisterUncreatableMetaObject",
+        b"_Z32qmlRegisterUncreatableMetaObjectRK11QMetaObjectPKciiS3_RK7QString",
+    ):
         return "rsi"  # (meta, uri, major, minor, name, reason)
-    if base == b"_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv":
+    if base in (
+        b"qmlregister",
+        b"_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv",
+    ):
         return "struct"
+    # Whole-struct copies. The URI is not in a register at the call; it is
+    # in the image memcpy/memset just wrote.
+    if base in (b"memcpy", b"memset"):
+        return base.decode()
     return None
 
 
@@ -1246,6 +1261,10 @@ def _call_targets(elf):
         stub = _x86_plt_stub(plt_bytes, plt_addr, index, got)
         if stub is None and elf.machine == 183:
             stub = _aarch64_plt_stub(plt_bytes, plt_addr, got)
+        if stub is None and elf.machine == 243:
+            stub = _riscv_plt_stub(plt_bytes, plt_addr, got)
+        if stub is None and elf.machine == 258:
+            stub = _loongarch_plt_stub(plt_bytes, plt_addr, got)
         if stub is not None:
             targets[stub] = kind
     return targets
@@ -1309,17 +1328,22 @@ def _aarch64_plt_stub(plt, plt_addr, got):
 
 
 def _modules_from_calls(elf):
-    if elf.cls != 2 or not elf.le or elf.machine not in (62, 183):
+    if elf.cls != 2 or not elf.le or elf.machine not in (62, 183, 243, 258):
         return set()
     targets = _call_targets(elf)
     if not targets:
         return set()
     found = set()
+    relocs = _relative_relocs(elf) if elf.machine in (243, 258) else {}
     for base, blob in elf.exec_ranges():
         if elf.machine == 62:
             found.update(_x86_call_modules(elf, blob, base, targets))
-        else:
+        elif elf.machine == 183:
             found.update(_aarch64_call_modules(elf, blob, base, targets))
+        elif elf.machine == 243:
+            found.update(_riscv_call_modules(elf, blob, base, targets, relocs))
+        else:
+            found.update(_loongarch_call_modules(elf, blob, base, targets, relocs))
     return found
 
 
@@ -2693,6 +2717,759 @@ def _aarch64_call_modules(elf, blob, base, targets):
                     found.add(module)
             elif kind == "struct":
                 found.update(_aarch64_struct_modules(elf, blob, base, off))
+        off += 4
+    return found
+
+
+def _sext(val, bits):
+    sign = 1 << (bits - 1)
+    return (val & (sign - 1)) - (val & sign)
+
+
+def _bits(val, hi, lo):
+    return (val >> lo) & ((1 << (hi - lo + 1)) - 1)
+
+
+def _relative_relocs(elf):
+    """Map vaddr -> addend for R_*_RELATIVE (type 3) entries.
+
+    RISC-V and LoongArch clang leave a zero in the file and put the
+    target vaddr in r_addend. The existing relocations() helper drops
+    the addend; callers of that 3-tuple are unchanged.
+    """
+    found = {}
+    if elf.cls != 2 or not elf.le:
+        return found
+    for sec in elf.sections:
+        if sec["type"] != 4 or not sec["size"]:
+            continue
+        step = sec["entsize"] or 24
+        blob = elf.data
+        for i in range(sec["size"] // step):
+            off = sec["offset"] + i * step
+            r_offset, r_info, r_addend = struct.unpack_from("<QQq", blob, off)
+            if (r_info & 0xFFFFFFFF) == 3 and r_addend > 0:
+                found[r_offset] = r_addend
+    return found
+
+
+def _new_track():
+    return {
+        "addr": {},
+        "page": {},
+        "imm": {},
+        "data": {},
+        "slot": {},
+        "mem": {},
+        "mirror": {},
+        "vec": {},
+        "stores": [],
+        "revs": [],
+    }
+
+
+def _gpr_clear(st, reg):
+    if not reg:
+        return
+    for key in ("addr", "page", "imm", "data", "slot"):
+        st[key].pop(reg, None)
+
+
+def _gpr_set_imm(st, reg, imm, sp):
+    if not reg or reg == sp:
+        return
+    _gpr_clear(st, reg)
+    st["imm"][reg] = imm
+
+
+def _gpr_set_addr(st, reg, addr, sp):
+    if not reg or reg == sp:
+        return
+    _gpr_clear(st, reg)
+    st["addr"][reg] = addr
+
+
+def _gpr_set_page(st, reg, addr, sp):
+    if not reg or reg == sp:
+        return
+    _gpr_clear(st, reg)
+    st["page"][reg] = addr
+
+
+def _gpr_set_slot(st, reg, disp, sp):
+    if not reg or reg == sp:
+        return
+    _gpr_clear(st, reg)
+    st["slot"][reg] = disp
+
+
+def _gpr_set_data(st, reg, raw, sp):
+    if not reg or reg == sp:
+        return
+    _gpr_clear(st, reg)
+    padded = (raw + b"\0" * 8)[:8]
+    st["data"][reg] = padded
+    # An 8-byte load of a QTypeRevision is a nonzero u16 and six zero
+    # bytes. The following sd/st.d is the revision store paired with the URI.
+    if len(raw) == 8 and raw[2:] == b"\0" * 6 and raw[:2] != b"\0\0":
+        st["imm"][reg] = int.from_bytes(raw[:2], "little")
+
+
+def _gpr_read(st, reg, sp):
+    if reg == 0:
+        return "imm", 0
+    if reg == sp:
+        return "slot", 0
+    if reg in st["slot"]:
+        return "slot", st["slot"][reg]
+    if reg in st["addr"]:
+        return "addr", st["addr"][reg]
+    if reg in st["imm"]:
+        return "imm", st["imm"][reg]
+    if reg in st["data"]:
+        return "data", st["data"][reg]
+    if reg in st["page"]:
+        return "page", st["page"][reg]
+    return None, None
+
+
+def _gpr_copy(st, rd, rs, sp):
+    kind, val = _gpr_read(st, rs, sp)
+    if kind == "slot":
+        _gpr_set_slot(st, rd, val, sp)
+    elif kind == "addr":
+        _gpr_set_addr(st, rd, val, sp)
+    elif kind == "page":
+        _gpr_set_page(st, rd, val, sp)
+    elif kind == "imm":
+        _gpr_set_imm(st, rd, val, sp)
+    elif kind == "data":
+        _gpr_set_data(st, rd, val, sp)
+    else:
+        _gpr_clear(st, rd)
+
+
+def _addi_reg(st, rd, rs, imm, sp):
+    """addi/addi.d. Writes to sp are frame adjustments and are ignored.
+
+    Offsets in the function are already relative to the sp they name.
+    Tracking `addi sp, sp, n` without the matching prologue would shift
+    every later slot.
+    """
+    if rd == sp:
+        return
+    if rs == 0:
+        _gpr_set_imm(st, rd, imm, sp)
+        return
+    if rs == sp:
+        _gpr_set_slot(st, rd, imm, sp)
+        return
+    if rs in st["page"]:
+        # auipc/pcalau12i is only a base. The addi completes the address.
+        _gpr_set_addr(st, rd, st["page"][rs] + imm, sp)
+        return
+    if rs in st["addr"]:
+        _gpr_set_addr(st, rd, st["addr"][rs] + imm, sp)
+        return
+    if rs in st["slot"]:
+        _gpr_set_slot(st, rd, st["slot"][rs] + imm, sp)
+        return
+    if rs in st["imm"]:
+        _gpr_set_imm(st, rd, st["imm"][rs] + imm, sp)
+        return
+    _gpr_clear(st, rd)
+
+
+def _clear_regs(st):
+    for key in ("addr", "page", "imm", "data", "slot", "vec"):
+        st[key].clear()
+
+
+def _reset_track(st):
+    _clear_regs(st)
+    st["mem"].clear()
+    st["mirror"].clear()
+    st["stores"].clear()
+    st["revs"].clear()
+
+
+def _clobber_callers(st, callers):
+    for reg in callers:
+        _gpr_clear(st, reg)
+    st["vec"].clear()
+
+
+def _on_jump(st, disp):
+    # A short forward branch is one arm of a cbz/b diamond. A long or
+    # backward branch joins unknown code. Stack bytes survive either way;
+    # ret is what drops them.
+    if 0 < disp <= 32:
+        return
+    _clear_regs(st)
+
+
+def _eff_addr(st, rs, imm, sp):
+    if rs == sp:
+        return "slot", imm
+    if rs in st["slot"]:
+        return "slot", st["slot"][rs] + imm
+    if rs in st["addr"]:
+        return "addr", st["addr"][rs] + imm
+    if rs in st["page"]:
+        return "addr", st["page"][rs] + imm
+    return None, None
+
+
+def _stack_write(st, disp, raw):
+    for i, byte in enumerate(raw):
+        st["mem"][disp + i] = byte
+        st["mirror"].pop(disp + i, None)
+
+
+def _stack_wipe(st, disp, width):
+    for i in range(width):
+        st["mem"].pop(disp + i, None)
+        st["mirror"].pop(disp + i, None)
+
+
+def _low_bytes(st, reg, width, sp):
+    kind, val = _gpr_read(st, reg, sp)
+    if kind == "imm":
+        return (val & ((1 << (8 * width)) - 1)).to_bytes(width, "little")
+    if kind == "data":
+        return val[:width]
+    return None
+
+
+def _note_store(st, reg, disp, width, off, sp):
+    kind, val = _gpr_read(st, reg, sp)
+    if width == 8 and kind in ("addr", "slot"):
+        st["stores"].append((off, kind, val, disp))
+        _stack_wipe(st, disp, 8)
+        return
+    raw = _low_bytes(st, reg, width, sp)
+    if raw is None:
+        _stack_wipe(st, disp, width)
+        if width == 2:
+            st["revs"].append((off, disp))
+        return
+    _stack_write(st, disp, raw)
+    if width == 2:
+        # Any halfword store can be the QTypeRevision. sd/st.d of an
+        # address is not: that is the pointer itself.
+        st["revs"].append((off, disp))
+    elif width > 2 and kind == "imm" and 0 < val <= 0xFFFF:
+        # Clang sometimes stores the revision with sd/st.d of `li 0x100`
+        # rather than sh/st.h.
+        st["revs"].append((off, disp))
+
+
+def _load_reg(elf, relocs, st, rd, rs, imm, width, sp):
+    ek, ev = _eff_addr(st, rs, imm, sp)
+    if ek == "addr" and width == 8 and ev in relocs:
+        _gpr_set_addr(st, rd, relocs[ev], sp)
+        return
+    raw = None
+    if ek == "addr":
+        raw = elf.bytes_at(ev, width)
+    elif ek == "slot":
+        if all(ev + i in st["mem"] for i in range(width)):
+            raw = bytes(st["mem"][ev + i] for i in range(width))
+    if raw is not None and len(raw) == width:
+        _gpr_set_data(st, rd, raw, sp)
+    else:
+        _gpr_clear(st, rd)
+
+
+def _mirror_span(elf, st, dest, src, size):
+    size = min(max(size, 0), 4096)
+    for i in range(size):
+        st["mirror"][dest + i] = src + i
+        raw = elf.bytes_at(src + i, 1)
+        if raw:
+            st["mem"][dest + i] = raw[0]
+        else:
+            st["mem"].pop(dest + i, None)
+
+
+def _version_shaped(raw):
+    return (
+        raw is not None
+        and len(raw) == 8
+        and raw[2:] == b"\0" * 6
+        and raw[:2] != b"\0\0"
+    )
+
+
+def _modules_from_template(elf, relocs, addr):
+    """URIs in a RegisterType image addressed directly."""
+    found = set()
+    for off in range(0, 512, 8):
+        if elf.bytes_at(addr + off, 16) is None:
+            break
+        ptr = relocs.get(addr + off)
+        if ptr is None or not _version_shaped(elf.bytes_at(addr + off + 8, 8)):
+            continue
+        module = _take_module(elf, ptr)
+        if module:
+            found.add(module)
+    return found
+
+
+def _modules_from_mirror(elf, relocs, st, slot):
+    """URIs in a memcpy/vector copy of a RegisterType image.
+
+    The pointer slots in the file are zero. R_*_RELATIVE carries the
+    string vaddr. The next qword must be a nonzero revision: a null
+    pointer (the usual follower of a meta-object name such as
+    NotificationSettings) has a zero low half and is not a module.
+    """
+    found = set()
+    mirror = st["mirror"]
+    for off in range(0, 512, 8):
+        base = slot + off
+        if not all(base + i in mirror for i in range(16)):
+            break
+        src = mirror[base]
+        if any(mirror[base + i] != src + i for i in range(16)):
+            break
+        ptr = relocs.get(src)
+        if ptr is None or not _version_shaped(elf.bytes_at(src + 8, 8)):
+            continue
+        module = _take_module(elf, ptr)
+        if module:
+            found.add(module)
+    return found
+
+
+def _struct_modules(elf, relocs, st, reg, sp):
+    found = set()
+    best = None
+    for soff, kind, val, disp in st["stores"]:
+        # Same 64-byte window as aarch64. Wider than that pairs a stale
+        # store with a later registration that reused the stack slot.
+        if not any(rdisp == disp + 8 and abs(roff - soff) < 64 for roff, rdisp in st["revs"]):
+            continue
+        if best is None or soff > best[0]:
+            best = (soff, kind, val)
+    if best is not None:
+        _soff, kind, val = best
+        if kind == "addr":
+            module = _take_module(elf, val)
+        else:
+            module = _module_from_stack(st["mem"], val, elf)
+        if module:
+            found.add(module)
+    kind, val = _gpr_read(st, reg, sp)
+    if kind == "slot":
+        found.update(_modules_from_mirror(elf, relocs, st, val))
+    elif kind == "addr":
+        found.update(_modules_from_template(elf, relocs, val))
+    return found
+
+
+def _module_from_gpr(elf, st, reg, sp):
+    kind, val = _gpr_read(st, reg, sp)
+    if kind == "addr":
+        return _take_module(elf, val)
+    if kind == "slot":
+        return _module_from_stack(st["mem"], val, elf)
+    return None
+
+
+def _finish_call(elf, relocs, st, targets, target, found, a0, a1, sp, callers):
+    kind = targets.get(target)
+    if kind == "memcpy":
+        # a2 is the argument register after a1 on both ABIs (x12 / r6).
+        dk, dest = _gpr_read(st, a0, sp)
+        sk, src = _gpr_read(st, a1, sp)
+        nk, size = _gpr_read(st, a1 + 1, sp)
+        if dk == "slot" and sk == "addr" and nk == "imm" and 0 < size <= 4096:
+            _mirror_span(elf, st, dest, src, size)
+    elif kind == "memset":
+        dk, dest = _gpr_read(st, a0, sp)
+        vk, val = _gpr_read(st, a1, sp)
+        nk, size = _gpr_read(st, a1 + 1, sp)
+        if dk == "slot" and vk == "imm" and val == 0 and nk == "imm" and 0 < size <= 4096:
+            for i in range(size):
+                st["mem"][dest + i] = 0
+                st["mirror"].pop(dest + i, None)
+    elif kind in ("rdi", "rsi"):
+        module = _module_from_gpr(elf, st, a0 if kind == "rdi" else a1, sp)
+        if module:
+            found.add(module)
+    elif kind == "struct":
+        found.update(_struct_modules(elf, relocs, st, a1, sp))
+    _clobber_callers(st, callers)
+
+
+# RISC-V caller-saved: ra, t0-t2, a0-a7, t3-t6. sp (x2) is not one of them.
+_RV_CALLERS = {1, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 28, 29, 30, 31}
+# LoongArch caller-saved: ra, a0-a7, t0-t8. r21 is reserved. sp is r3.
+_LA_CALLERS = {1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+
+
+def _rv_auipc_imm(word):
+    imm = word & 0xFFFFF000
+    if imm >= 0x80000000:
+        imm -= 0x100000000
+    return imm
+
+
+def _rv_jal_imm(word):
+    imm = ((word >> 31) & 1) << 20
+    imm |= ((word >> 12) & 0xFF) << 12
+    imm |= ((word >> 20) & 1) << 11
+    imm |= ((word >> 21) & 0x3FF) << 1
+    return _sext(imm, 21)
+
+
+def _rv_itype_imm(word):
+    return _sext((word >> 20) & 0xFFF, 12)
+
+
+def _rv_stype_imm(word):
+    return _sext(((word >> 25) << 5) | ((word >> 7) & 0x1F), 12)
+
+
+def _riscv_plt_stub(plt, plt_addr, got):
+    """Address of an auipc/ld/jalr PLT stub whose GOT slot is got."""
+    off = 0
+    limit = len(plt) - 12
+    while off <= limit:
+        w0 = int.from_bytes(plt[off:off + 4], "little")
+        w1 = int.from_bytes(plt[off + 4:off + 8], "little")
+        w2 = int.from_bytes(plt[off + 8:off + 12], "little")
+        if (
+            (w0 & 0x7F) == 0x17
+            and (w1 & 0x7F) == 0x03
+            and ((w1 >> 12) & 7) == 3
+            and (w2 & 0x7F) == 0x67
+        ):
+            rd = (w0 >> 7) & 31
+            ld_rd = (w1 >> 7) & 31
+            ld_rs = (w1 >> 15) & 31
+            jr_rd = (w2 >> 7) & 31
+            jr_rs = (w2 >> 15) & 31
+            jr_imm = _rv_itype_imm(w2)
+            if rd and rd == ld_rd == ld_rs == jr_rs and jr_rd and jr_imm == 0:
+                pc = plt_addr + off
+                if pc + _rv_auipc_imm(w0) + _rv_itype_imm(w1) == got:
+                    return pc
+        off += 4
+    return None
+
+
+def _rv_c_j_imm(enc):
+    imm = (
+        (_bits(enc, 12, 12) << 11)
+        | (_bits(enc, 8, 8) << 10)
+        | (_bits(enc, 10, 9) << 8)
+        | (_bits(enc, 6, 6) << 7)
+        | (_bits(enc, 7, 7) << 6)
+        | (_bits(enc, 2, 2) << 5)
+        | (_bits(enc, 11, 11) << 4)
+        | (_bits(enc, 5, 3) << 1)
+    )
+    return _sext(imm, 12)
+
+
+def _rv_c_b_imm(enc):
+    imm = (
+        (_bits(enc, 12, 12) << 8)
+        | (_bits(enc, 6, 5) << 6)
+        | (_bits(enc, 2, 2) << 5)
+        | (_bits(enc, 11, 10) << 3)
+        | (_bits(enc, 4, 3) << 1)
+    )
+    return _sext(imm, 9)
+
+
+def _riscv_compressed(elf, relocs, st, targets, found, blob, base, off, enc):
+    sp = 2
+    pc = base + off
+    quad = enc & 3
+    funct3 = (enc >> 13) & 7
+    if quad == 0:
+        if funct3 == 0:  # c.addi4spn
+            imm = (
+                (_bits(enc, 10, 7) << 6)
+                | (_bits(enc, 12, 11) << 4)
+                | (_bits(enc, 5, 5) << 3)
+                | (_bits(enc, 6, 6) << 2)
+            )
+            rd = 8 + _bits(enc, 4, 2)
+            if imm:
+                _gpr_set_slot(st, rd, imm, sp)
+        elif funct3 == 2:  # c.lw
+            imm = (
+                (_bits(enc, 5, 5) << 6)
+                | (_bits(enc, 12, 10) << 3)
+                | (_bits(enc, 6, 6) << 2)
+            )
+            _load_reg(elf, relocs, st, 8 + _bits(enc, 4, 2), 8 + _bits(enc, 9, 7), imm, 4, sp)
+        elif funct3 == 3:  # c.ld
+            imm = (_bits(enc, 12, 10) << 3) | (_bits(enc, 6, 5) << 6)
+            _load_reg(elf, relocs, st, 8 + _bits(enc, 4, 2), 8 + _bits(enc, 9, 7), imm, 8, sp)
+        elif funct3 == 6:  # c.sw
+            imm = (
+                (_bits(enc, 5, 5) << 6)
+                | (_bits(enc, 12, 10) << 3)
+                | (_bits(enc, 6, 6) << 2)
+            )
+            ek, ev = _eff_addr(st, 8 + _bits(enc, 9, 7), imm, sp)
+            if ek == "slot":
+                _note_store(st, 8 + _bits(enc, 4, 2), ev, 4, off, sp)
+        elif funct3 == 7:  # c.sd
+            imm = (_bits(enc, 12, 10) << 3) | (_bits(enc, 6, 5) << 6)
+            ek, ev = _eff_addr(st, 8 + _bits(enc, 9, 7), imm, sp)
+            if ek == "slot":
+                _note_store(st, 8 + _bits(enc, 4, 2), ev, 8, off, sp)
+        return
+    if quad == 1:
+        rd = _bits(enc, 11, 7)
+        imm6 = _sext((_bits(enc, 12, 12) << 5) | _bits(enc, 6, 2), 6)
+        if funct3 in (0, 1):  # c.addi / c.addiw
+            if rd:
+                _addi_reg(st, rd, rd, imm6, sp)
+        elif funct3 == 2:  # c.li
+            _gpr_set_imm(st, rd, imm6, sp)
+        elif funct3 == 3:
+            if rd == 2:  # c.addi16sp
+                return
+            # c.lui
+            if imm6:
+                _gpr_set_imm(st, rd, imm6 << 12, sp)
+        elif funct3 == 4:
+            _gpr_clear(st, 8 + _bits(enc, 9, 7))
+        elif funct3 == 5:  # c.j
+            _on_jump(st, _rv_c_j_imm(enc))
+        # c.beqz / c.bnez: fall through, same as an untaken conditional.
+        return
+    # quadrant 2
+    rd = _bits(enc, 11, 7)
+    if funct3 == 0:  # c.slli
+        shamt = (_bits(enc, 12, 12) << 5) | _bits(enc, 6, 2)
+        if rd in st["imm"] and shamt:
+            _gpr_set_imm(st, rd, st["imm"][rd] << shamt, sp)
+        elif shamt:
+            _gpr_clear(st, rd)
+    elif funct3 == 2:  # c.lwsp
+        imm = (_bits(enc, 12, 12) << 5) | (_bits(enc, 6, 4) << 2) | (_bits(enc, 3, 2) << 6)
+        _load_reg(elf, relocs, st, rd, sp, imm, 4, sp)
+    elif funct3 == 3:  # c.ldsp
+        imm = (_bits(enc, 12, 12) << 5) | (_bits(enc, 6, 5) << 3) | (_bits(enc, 4, 2) << 6)
+        _load_reg(elf, relocs, st, rd, sp, imm, 8, sp)
+    elif funct3 == 4:
+        rs2 = _bits(enc, 6, 2)
+        if (enc & 0x1000) == 0:
+            if rs2 == 0:
+                if rd == 1:
+                    _reset_track(st)  # c.jr ra
+                elif rd:
+                    _clear_regs(st)
+            else:
+                _gpr_copy(st, rd, rs2, sp)  # c.mv
+        elif rs2 == 0:
+            if rd:
+                # c.jalr: indirect call. The direct jal to the PLT is the one we name.
+                _clobber_callers(st, _RV_CALLERS)
+        else:
+            _gpr_clear(st, rd)  # c.add and the word forms; value is unknown
+    elif funct3 == 6:  # c.swsp
+        imm = (_bits(enc, 8, 7) << 6) | (_bits(enc, 12, 9) << 2)
+        _note_store(st, _bits(enc, 6, 2), imm, 4, off, sp)
+    elif funct3 == 7:  # c.sdsp
+        imm = (_bits(enc, 9, 7) << 6) | (_bits(enc, 12, 10) << 3)
+        _note_store(st, _bits(enc, 6, 2), imm, 8, off, sp)
+
+
+def _riscv_word(elf, relocs, st, targets, found, base, off, word):
+    sp = 2
+    pc = base + off
+    opcode = word & 0x7F
+    rd = (word >> 7) & 31
+    funct3 = (word >> 12) & 7
+    rs1 = (word >> 15) & 31
+    rs2 = (word >> 20) & 31
+    if opcode == 0x17:  # auipc
+        _gpr_set_page(st, rd, pc + _rv_auipc_imm(word), sp)
+    elif opcode == 0x37:  # lui
+        _gpr_set_imm(st, rd, _rv_auipc_imm(word), sp)
+    elif opcode == 0x13 and funct3 == 0:  # addi
+        _addi_reg(st, rd, rs1, _rv_itype_imm(word), sp)
+    elif opcode == 0x13:
+        _gpr_clear(st, rd)
+    elif opcode == 0x03:
+        width = {0: 1, 1: 2, 2: 4, 3: 8, 4: 1, 5: 2, 6: 4}.get(funct3)
+        if width is None:
+            _gpr_clear(st, rd)
+        else:
+            _load_reg(elf, relocs, st, rd, rs1, _rv_itype_imm(word), width, sp)
+    elif opcode == 0x23:
+        width = {0: 1, 1: 2, 2: 4, 3: 8}.get(funct3)
+        if width is not None:
+            ek, ev = _eff_addr(st, rs1, _rv_stype_imm(word), sp)
+            if ek == "slot":
+                _note_store(st, rs2, ev, width, off, sp)
+    elif opcode == 0x6F:  # jal
+        disp = _rv_jal_imm(word)
+        if rd == 0:
+            _on_jump(st, disp)
+        else:
+            _finish_call(
+                elf, relocs, st, targets, pc + disp, found, 10, 11, sp, _RV_CALLERS
+            )
+    elif opcode == 0x67 and funct3 == 0:  # jalr
+        imm = _rv_itype_imm(word)
+        if rd == 0 and rs1 == 1 and imm == 0:
+            _reset_track(st)
+        elif rd == 0:
+            _clear_regs(st)
+        else:
+            _clobber_callers(st, _RV_CALLERS)
+    elif opcode in (0x33, 0x1B, 0x3B):
+        _gpr_clear(st, rd)
+    # Branches (0x63) fall through. Fence and system write nothing we track.
+
+
+def _riscv_call_modules(elf, blob, base, targets, relocs):
+    found = set()
+    st = _new_track()
+    off = 0
+    while off + 2 <= len(blob):
+        half = int.from_bytes(blob[off:off + 2], "little")
+        if (half & 3) != 3:
+            _riscv_compressed(elf, relocs, st, targets, found, blob, base, off, half)
+            off += 2
+            continue
+        if off + 4 > len(blob):
+            break
+        word = int.from_bytes(blob[off:off + 4], "little")
+        _riscv_word(elf, relocs, st, targets, found, base, off, word)
+        off += 4
+    return found
+
+
+def _larch_2ri12(word):
+    return (
+        word >> 22,
+        _sext((word >> 10) & 0xFFF, 12),
+        (word >> 5) & 31,
+        word & 31,
+    )
+
+
+def _larch_i26(word):
+    """Byte offset of b/bl. offs26 is split into bits[25:10] and bits[9:0]."""
+    low = word & 0x3FFFFFF
+    offs = ((low & 0x3FF) << 16) | ((low >> 10) & 0xFFFF)
+    return _sext(offs, 26) << 2
+
+
+def _loongarch_plt_stub(plt, plt_addr, got):
+    """Address of a pcaddu12i/ld.d/jirl PLT stub whose GOT slot is got."""
+    off = 0
+    limit = len(plt) - 12
+    while off <= limit:
+        w0 = int.from_bytes(plt[off:off + 4], "little")
+        w1 = int.from_bytes(plt[off + 4:off + 8], "little")
+        w2 = int.from_bytes(plt[off + 8:off + 12], "little")
+        if (w0 >> 25) == 0x0E and (w1 >> 22) == 0x0A3 and (w2 >> 22) == 0x130:
+            rd = w0 & 31
+            si20 = _sext((w0 >> 5) & 0xFFFFF, 20)
+            _op, si12, rj, rd1 = _larch_2ri12(w1)
+            jrd = w2 & 31
+            jrs = (w2 >> 5) & 31
+            jimm = _sext((w2 >> 10) & 0xFFF, 12)
+            if rd and rd == rj == rd1 == jrs and jrd and jimm == 0:
+                pc = plt_addr + off
+                if pc + (si20 << 12) + si12 == got:
+                    return pc
+        off += 4
+    return None
+
+
+_LA_LOAD = {0x0A0: 1, 0x0A1: 2, 0x0A2: 4, 0x0A3: 8, 0x0A8: 1, 0x0A9: 2, 0x0AA: 4}
+_LA_STORE = {0x0A4: 1, 0x0A5: 2, 0x0A6: 4, 0x0A7: 8}
+
+
+def _loongarch_call_modules(elf, blob, base, targets, relocs):
+    found = set()
+    st = _new_track()
+    sp = 3
+    off = 0
+    limit = len(blob) - 3
+    while off <= limit:
+        word = int.from_bytes(blob[off:off + 4], "little")
+        pc = base + off
+        op10, si12, rj, rd = _larch_2ri12(word)
+        op7 = word >> 25
+        op6 = word >> 26
+        if op7 in (0x0C, 0x0D, 0x0E):
+            si20 = _sext((word >> 5) & 0xFFFFF, 20)
+            if op7 == 0x0C:  # pcaddi: pc + si20<<2, already the final address
+                _gpr_set_addr(st, rd, pc + (si20 << 2), sp)
+            elif op7 == 0x0D:  # pcalau12i: page, completed by addi.d
+                _gpr_set_page(st, rd, (pc & ~0xFFF) + (si20 << 12), sp)
+            else:  # pcaddu12i: pc + si20<<12, not a string until addi.d
+                _gpr_set_page(st, rd, pc + (si20 << 12), sp)
+        elif op6 == 0x15:  # bl
+            _finish_call(
+                elf, relocs, st, targets, pc + _larch_i26(word), found, 4, 5, sp, _LA_CALLERS
+            )
+        elif op6 == 0x14:  # b
+            _on_jump(st, _larch_i26(word))
+        elif (word >> 15) == 0x2A:  # or / move
+            rk = (word >> 10) & 31
+            if rk == 0:
+                _gpr_copy(st, rd, rj, sp)
+            elif rj == 0:
+                _gpr_copy(st, rd, rk, sp)
+            else:
+                _gpr_clear(st, rd)
+        elif op10 == 0x130:  # jirl
+            if rd == 0 and rj == 1 and si12 == 0:
+                _reset_track(st)  # ret
+            elif rd == 0:
+                _clear_regs(st)
+            else:
+                _clobber_callers(st, _LA_CALLERS)
+        elif op10 == 0x00B:  # addi.d
+            _addi_reg(st, rd, rj, si12, sp)
+        elif op10 == 0x00E:  # ori. The 12-bit immediate is zero-extended.
+            uimm = (word >> 10) & 0xFFF
+            if rj == 0:
+                _gpr_set_imm(st, rd, uimm, sp)
+            elif uimm == 0:
+                _gpr_copy(st, rd, rj, sp)
+            elif rj in st["imm"]:
+                _gpr_set_imm(st, rd, (st["imm"][rj] | uimm) & ((1 << 64) - 1), sp)
+            else:
+                _gpr_clear(st, rd)
+        elif op10 in _LA_LOAD:
+            _load_reg(elf, relocs, st, rd, rj, si12, _LA_LOAD[op10], sp)
+        elif op10 in _LA_STORE:
+            ek, ev = _eff_addr(st, rj, si12, sp)
+            if ek == "slot":
+                _note_store(st, rd, ev, _LA_STORE[op10], off, sp)
+        elif op10 == 0x0B0:  # vld
+            ek, ev = _eff_addr(st, rj, si12, sp)
+            if ek == "addr":
+                st["vec"][rd] = ev
+            else:
+                st["vec"].pop(rd, None)
+        elif op10 == 0x0B1:  # vst
+            ek, ev = _eff_addr(st, rj, si12, sp)
+            src = st["vec"].get(rd)
+            if ek == "slot" and src is not None:
+                _mirror_span(elf, st, ev, src, 16)
+            elif ek == "slot":
+                _stack_wipe(st, ev, 16)
+        else:
+            # Integer ops write rd. Stores and branches were handled above,
+            # so this does not drop the source of an st.d.
+            _gpr_clear(st, rd)
         off += 4
     return found
 
