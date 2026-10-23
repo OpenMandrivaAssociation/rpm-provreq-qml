@@ -2214,6 +2214,20 @@ def _x86_call_modules(elf, blob, base, targets):
     return found
 
 
+def _aarch64_adr(word, pc):
+    """adr xd, label. Returns (rd, address) or None.
+
+    Clang uses adr, not adrp+add, when the string is within 1 MB.
+    """
+    if (word & 0x9F000000) != 0x10000000:
+        return None
+    rd = word & 0x1F
+    imm = ((word >> 5) & 0x7FFFF) << 2 | ((word >> 29) & 3)
+    if imm & (1 << 20):
+        imm -= 1 << 21
+    return rd, pc + imm
+
+
 def _aarch64_adrp(word, pc):
     if (word & 0x9F000000) != 0x90000000:
         return None
@@ -2222,6 +2236,20 @@ def _aarch64_adrp(word, pc):
     if imm & (1 << 20):
         imm -= 1 << 21
     return rd, (pc & ~0xFFF) + (imm << 12)
+
+
+def _aarch64_stp64(word):
+    """stp xt, xt2, [xn, #imm]. Returns (rt, rt2, rn, byte_off) or None.
+
+    Clang stores a null pointer and the URI with one stp, so the URI is the
+    second register at disp+8. xzr (register 31) is not a pointer.
+    """
+    if (word & 0xFFC00000) != 0xA9000000:
+        return None
+    imm7 = (word >> 15) & 0x7F
+    if imm7 & 0x40:
+        imm7 -= 0x80
+    return word & 31, (word >> 10) & 31, (word >> 5) & 31, imm7 * 8
 
 
 def _aarch64_add_imm(word):
@@ -2336,10 +2364,16 @@ def _aarch64_pointer(blob, base, lo, hi, reg):
     off = lo - (lo % 4)
     while off + 4 <= hi:
         word = int.from_bytes(blob[off:off + 4], "little")
+        adr = _aarch64_adr(word, base + off)
         adrp = _aarch64_adrp(word, base + off)
         add = _aarch64_add_imm(word)
-        if adrp is not None and adrp[0] == reg:
+        if adr is not None and adr[0] == reg:
+            best = (off, ("rip", adr[1]))
+            addr[reg] = adr[1]
+        elif adrp is not None and adrp[0] == reg:
+            # A page address is not the pointer. The following add completes it.
             addr[reg] = adrp[1]
+            best = None
         elif add is not None and add[0] == reg and add[1] == reg and reg in addr:
             best = (off, ("rip", addr[reg] + add[2]))
             addr[reg] = addr[reg] + add[2]
@@ -2396,6 +2430,13 @@ def _aarch64_stack_image(elf, blob, base, lo, hi):
             slot_of.pop(rd, None)
             off += 4
             continue
+        adr = _aarch64_adr(word, pc)
+        if adr is not None:
+            addr[adr[0]] = adr[1]
+            data.pop(adr[0], None)
+            slot_of.pop(adr[0], None)
+            off += 4
+            continue
         adrp = _aarch64_adrp(word, pc)
         if adrp is not None:
             addr[adrp[0]] = adrp[1]
@@ -2405,7 +2446,11 @@ def _aarch64_stack_image(elf, blob, base, lo, hi):
             continue
         add = _aarch64_add_imm(word)
         if add is not None and add[1] == 31:
-            slot_of[add[0]] = add[2]
+            # `add sp, sp, #n` is a frame adjustment. Offsets elsewhere in
+            # the function are already relative to the sp they name, and
+            # the matching `sub sp` is not decoded, so sp stays at 0.
+            if add[0] != 31:
+                slot_of[add[0]] = add[2]
             addr.pop(add[0], None)
             data.pop(add[0], None)
             off += 4
@@ -2482,9 +2527,28 @@ def _aarch64_stack_image(elf, blob, base, lo, hi):
                 _x86_write(mem, slot_of[rn] + disp, data[rt].to_bytes(4, "little"))
             off += 4
             continue
-        # BL / B. Caller-saved state does not survive. sp is unchanged here
-        # (writeback forms are not this opcode).
-        if (word >> 26) in (0b100101, 0b000101):
+        # BL clobbers caller-saved state. x19-x29 keep a stack slot across
+        # the call; clang addresses a copied URI with `add x22, sp, #n`
+        # and only writes it after constructing other objects. A short
+        # forward B is the other arm of a cbz/b diamond and also leaves
+        # those registers alone. A long or backward B joins unknown code.
+        branch = word >> 26
+        short_forward = False
+        if branch == 0b000101:
+            imm = word & 0x03FFFFFF
+            if imm & 0x02000000:
+                imm -= 0x04000000
+            short_forward = 0 < imm * 4 <= 32
+        if branch == 0b100101 or short_forward:
+            for reg in [reg for reg in addr if reg < 19 or reg == 30]:
+                addr.pop(reg, None)
+            for reg in [reg for reg in data if reg < 19 or reg == 30]:
+                data.pop(reg, None)
+            qval.clear()
+            for reg in [reg for reg in slot_of if reg < 19 or reg == 30]:
+                slot_of.pop(reg, None)
+            slot_of[31] = 0
+        elif branch == 0b000101:
             addr.clear()
             data.clear()
             qval.clear()
@@ -2506,7 +2570,7 @@ def _aarch64_gpr_dest(word):
         return None
     if (word & 0xFFC00000) in (0xF9400000, 0xB9400000, 0x79400000):
         return word & 31
-    if (word & 0x9F000000) == 0x90000000:
+    if (word & 0x9F000000) in (0x10000000, 0x90000000):
         return word & 31
     if (word & 0xFF800000) in (0x52800000, 0x72800000, 0xD2800000, 0xF2800000):
         return word & 31
@@ -2556,6 +2620,17 @@ def _aarch64_struct_modules(elf, blob, base, call_off):
             resolved = _aarch64_frame_slot(slot_of, store[1], store[2])
             if resolved is not None:
                 stores.append((off, store[0], resolved[0], resolved[1]))
+        pair = _aarch64_stp64(word)
+        if pair is not None:
+            rt, rt2, rn, disp = pair
+            for reg, extra in ((rt, 0), (rt2, 8)):
+                if reg == 31:
+                    continue
+                resolved = _aarch64_frame_slot(slot_of, rn, disp + extra)
+                if resolved is not None:
+                    # Same instruction offset for both halves. xzr is skipped,
+                    # and the URI in `stp xzr, xURI` is the only store recorded.
+                    stores.append((off, reg, resolved[0], resolved[1]))
         half = _aarch64_strh(word)
         if half is not None:
             resolved = _aarch64_frame_slot(slot_of, half[1], half[2])
@@ -2564,8 +2639,12 @@ def _aarch64_struct_modules(elf, blob, base, call_off):
         off += 4
     best = None
     for soff, reg, sbase, disp in stores:
+        # 64 bytes, not 48. Clang's `stp` of the URI and the `strh` of the
+        # following QTypeRevision are 52 bytes apart in kcm_cursortheme.
+        # Wider than that pairs a stale store with a later registration
+        # that reused the same stack slot.
         if not any(
-            mbase == sbase and mdisp == disp + 8 and abs(moff - soff) < 48
+            mbase == sbase and mdisp == disp + 8 and abs(moff - soff) < 64
             for moff, mbase, mdisp in words
         ):
             continue

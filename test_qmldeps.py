@@ -558,6 +558,69 @@ def build_elf(machine, parts, symbols, relas=None):
     return bytes(blob)
 
 
+def aarch64_adr(rd, pc, target):
+    imm = target - pc
+    if not -(1 << 20) <= imm < (1 << 20):
+        raise ValueError(hex(imm))
+    if imm < 0:
+        imm += 1 << 21
+    immlo = imm & 3
+    immhi = (imm >> 2) & 0x7FFFF
+    return (immlo << 29) | 0x10000000 | (immhi << 5) | rd
+
+
+def aarch64_add(rd, rn, imm):
+    return 0x91000000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd
+
+
+def aarch64_str64(rt, rn, disp):
+    return 0xF9000000 | ((disp // 8) << 10) | (rn << 5) | rt
+
+
+def aarch64_strh(rt, rn, disp):
+    return 0x79000000 | ((disp // 2) << 10) | (rn << 5) | rt
+
+
+def aarch64_stp64(rt, rt2, rn, disp):
+    return 0xA9000000 | (((disp // 8) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt
+
+
+def aarch64_ldr_q(rt, rn, disp=0):
+    return 0x3DC00000 | ((disp // 16) << 10) | (rn << 5) | rt
+
+
+def aarch64_str_q(rt, rn, disp=0):
+    return 0x3D800000 | ((disp // 16) << 10) | (rn << 5) | rt
+
+
+def aarch64_b(byte_disp):
+    return 0x14000000 | ((byte_disp // 4) & 0x03FFFFFF)
+
+
+def aarch64_bl(pc, target=0x3000):
+    return 0x94000000 | (((target - pc) >> 2) & 0x03FFFFFF)
+
+
+def aarch64_register_elf(words, rodata=b""):
+    """ELF whose last instruction is BL to a qmlregister PLT stub."""
+    bl_at = 0x1000 + 4 * len(words)
+    text_words = list(words) + [aarch64_bl(bl_at)]
+    text = b"".join(word.to_bytes(4, "little") for word in text_words)
+    plt = b"".join(word.to_bytes(4, "little") for word in (
+        0x90000010, 0xF9408211, 0xD61F0220, 0xD503201F,
+    ))
+    parts = [(".text", SHT_PROGBITS, 6, 0x1000, 0, text)]
+    if rodata:
+        parts.append((".rodata", SHT_PROGBITS, 2, 0x2000, 0, rodata))
+    parts.append((".plt", SHT_PROGBITS, 6, 0x3000, 0, plt))
+    return build_elf(
+        EM_AARCH64,
+        parts,
+        [("_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv", 0, 0)],
+        [(0x3100, 1)],
+    )
+
+
 def x86_plt(index, stub_va, got):
     disp = got - (stub_va + 6)
     return (
@@ -1129,6 +1192,96 @@ class CppProvideTests(unittest.TestCase):
             [(0x3100, 1)],
         )
         self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.exampleX"})
+
+    def test_aarch64_adr_overrides_earlier_page_address(self):
+        # feedback: adrp+add leaves a vtable in x8, then adr loads the URI.
+        raw = b"org.kde.decoy\0org.kde.kept\0"
+        kept = 0x2000 + raw.index(b"org.kde.kept")
+        adr_at = 0x1008
+        words = [
+            0xB0000008,  # adrp x8, 0x2000
+            aarch64_add(8, 8, 0),
+            aarch64_adr(8, adr_at, kept),
+            aarch64_str64(8, 31, 0x50),
+            aarch64_strh(2, 31, 0x58),
+        ]
+        self.assertEqual(qd._aarch64_adr(words[2], adr_at), (8, kept))
+        elf = aarch64_register_elf(words, raw)
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.kept"})
+
+    def test_aarch64_struct_uri_stored_with_stp(self):
+        # autostart: `stp xzr, x20, [sp, #imm]` puts the URI at disp+8.
+        raw = b"org.kde.plasma.kcm.autostart\0"
+        words = [
+            0xB0000014,  # adrp x20, 0x2000
+            aarch64_add(20, 20, 0),
+            aarch64_stp64(31, 20, 31, 0x48),
+            aarch64_strh(2, 31, 0x58),
+        ]
+        self.assertEqual(qd._aarch64_stp64(words[2]), (31, 20, 31, 0x48))
+        elf = aarch64_register_elf(words, raw)
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.plasma.kcm.autostart"})
+
+    def test_aarch64_adr_uri_stored_with_stp(self):
+        raw = b"org.kde.plasma.kcm.users\0"
+        words = [
+            aarch64_adr(21, 0x1000, 0x2000),
+            aarch64_stp64(31, 21, 31, 0x48),
+            aarch64_strh(2, 31, 0x58),
+        ]
+        elf = aarch64_register_elf(words, raw)
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.plasma.kcm.users"})
+
+    def test_aarch64_stp_pairs_with_strh_52_bytes_later(self):
+        # cursortheme: 13 instructions, 52 bytes, between the stp and the strh.
+        raw = b"org.kde.private.kcm_cursortheme\0"
+        words = [
+            0xB0000008,  # adrp x8, 0x2000
+            aarch64_add(8, 8, 0),
+            aarch64_stp64(31, 8, 31, 0x48),
+        ]
+        words.extend([0xD503201F] * 12)  # nop
+        words.append(aarch64_strh(2, 31, 0x58))
+        self.assertEqual(4 * (len(words) - 1 - 2), 52)
+        elf = aarch64_register_elf(words, raw)
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.private.kcm_cursortheme"})
+
+    def test_aarch64_callee_saved_slot_survives_short_branch(self):
+        # lookandfeel: `add x22, sp, #n` before a cbz/b diamond and a BL,
+        # then the URI is copied through x22. The rodata has no NUL, so a
+        # missed stack image cannot fall back to a C string search.
+        raw = b"org.kde.exampleX" + b"\xff" * 16
+        words = [
+            aarch64_add(22, 31, 0x40),
+            aarch64_b(8),
+            0xD503201F,  # nop, the other arm of the diamond
+            aarch64_bl(0x100c),
+            0xB0000009,  # adrp x9, 0x2000
+            aarch64_add(9, 9, 0),
+            aarch64_ldr_q(0, 9),
+            aarch64_str_q(0, 22),
+            0x39000000 | (0x50 << 10) | (31 << 5) | 31,  # strb wzr, [sp, #0x50]
+            aarch64_str64(22, 31, 0x90),
+            aarch64_strh(2, 31, 0x98),
+        ]
+        elf = aarch64_register_elf(words, raw)
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.exampleX"})
+
+    def test_aarch64_long_branch_drops_callee_saved_slot(self):
+        raw = b"org.kde.exampleX" + b"\xff" * 16
+        words = [
+            aarch64_add(22, 31, 0x40),
+            aarch64_b(0x100),
+            0xB0000009,
+            aarch64_add(9, 9, 0),
+            aarch64_ldr_q(0, 9),
+            aarch64_str_q(0, 22),
+            0x39000000 | (0x50 << 10) | (31 << 5) | 31,
+            aarch64_str64(22, 31, 0x90),
+            aarch64_strh(2, 31, 0x98),
+        ]
+        elf = aarch64_register_elf(words, raw)
+        self.assertEqual(qd.cpp_qml_modules(elf), set())
 
 
 class InstalledCppTests(unittest.TestCase):
