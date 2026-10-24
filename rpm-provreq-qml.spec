@@ -1,6 +1,6 @@
 Name:		rpm-provreq-qml
 Version:	6.2.0
-Release:	5
+Release:	6
 Summary:	RPM Provides/Requires generator for QML files
 Group:		Development/KDE and Qt
 BuildArch:	noarch

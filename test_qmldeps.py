@@ -500,6 +500,7 @@ EM_X86_64 = 62
 EM_AARCH64 = 183
 EM_RISCV = 243
 EM_LOONGARCH = 258
+EM_PPC64 = 21
 
 
 def _strtab(strings):
@@ -513,22 +514,26 @@ def _strtab(strings):
     return bytes(blob), offsets
 
 
-def build_elf(machine, parts, symbols, relas=None, relatives=None):
+def build_elf(
+    machine, parts, symbols, relas=None, relatives=None, endian="little", relative_type=3
+):
     """Tiny ELF64 shared object.
 
     parts: (name, type, flags, addr, entsize, data)
     symbols: (name, value, shndx) after the null symbol. shndx 0 is undefined.
     relas: (got_addr, symbol_index) with symbol_index 1-based.
-    relatives: (vaddr, addend) R_*_RELATIVE entries, type 3.
+    relatives: (vaddr, addend) R_*_RELATIVE entries. Type 3, or 22 on ppc64.
+    endian: "little" or "big". ppc64 is big-endian; ppc64le is little-endian.
     """
+    e = "<" if endian == "little" else ">"
     dynstr, dynoff = _strtab([name for name, _value, _shndx in symbols])
-    dynsym = [struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0)]
+    dynsym = [struct.pack(e + "IBBHQQ", 0, 0, 0, 0, 0, 0)]
     for name, value, shndx in symbols:
         info = 0x12 if shndx else 0x10
-        dynsym.append(struct.pack("<IBBHQQ", dynoff[name], info, 0, shndx, value, 0))
+        dynsym.append(struct.pack(e + "IBBHQQ", dynoff[name], info, 0, shndx, value, 0))
     rela = b""
     for got, symi in relas or ():
-        rela += struct.pack("<QQq", got, (symi << 32) | 7, 0)
+        rela += struct.pack(e + "QQq", got, (symi << 32) | 7, 0)
     items = [("", 0, 0, 0, 0, b"")]
     items.extend(parts)
     items.append((".dynstr", SHT_STRTAB, 0, 0, 0, dynstr))
@@ -537,7 +542,7 @@ def build_elf(machine, parts, symbols, relas=None, relatives=None):
         items.append((".rela.plt", SHT_RELA, 0, 0, 24, rela))
     if relatives:
         rela_dyn = b"".join(
-            struct.pack("<QQq", off, 3, addend) for off, addend in relatives
+            struct.pack(e + "QQq", off, relative_type, addend) for off, addend in relatives
         )
         items.append((".rela.dyn", SHT_RELA, 0, 0, 24, rela_dyn))
     shstr, nameoff = _strtab([name for name, *_rest in items] + [".shstrtab"])
@@ -554,15 +559,15 @@ def build_elf(machine, parts, symbols, relas=None, relatives=None):
     shoff = len(blob)
     for (name, typ, flags, addr, entsize, data), off in zip(items, offsets):
         blob += struct.pack(
-            "<IIQQQQIIQQ", nameoff[name], typ, flags, addr, off, len(data), 0, 0, 1, entsize
+            e + "IIQQQQIIQQ", nameoff[name], typ, flags, addr, off, len(data), 0, 0, 1, entsize
         )
     struct.pack_into(
-        "<HHIQQQIHHHHHH", blob, 16,
+        e + "HHIQQQIHHHHHH", blob, 16,
         3, machine, 1, 0, 0, shoff, 0, 64, 0, 0, 64, len(items), len(items) - 1,
     )
     blob[0:4] = b"\x7fELF"
     blob[4] = 2
-    blob[5] = 1
+    blob[5] = 1 if endian == "little" else 2
     blob[6] = 1
     return bytes(blob)
 
@@ -1612,6 +1617,431 @@ class RiscvLoongarchTests(unittest.TestCase):
             self.assertNotIn("NotificationSettings", found)
             self.assertNotIn("User", found)
 
+
+def ppc_words(endian, *words):
+    order = "little" if endian == "little" else "big"
+    return b"".join((word & 0xFFFFFFFF).to_bytes(4, order) for word in words)
+
+
+def ppc_d(op, rt, ra, simm):
+    return ((op & 0x3F) << 26) | ((rt & 31) << 21) | ((ra & 31) << 16) | (simm & 0xFFFF)
+
+
+def ppc_ds(op, rt, ra, disp, xo=0):
+    return (
+        ((op & 0x3F) << 26)
+        | ((rt & 31) << 21)
+        | ((ra & 31) << 16)
+        | (((disp >> 2) & 0x3FFF) << 2)
+        | (xo & 3)
+    )
+
+
+def ppc_x(xo, rs, ra, rb):
+    return (
+        (31 << 26)
+        | ((rs & 31) << 21)
+        | ((ra & 31) << 16)
+        | ((rb & 31) << 11)
+        | ((xo & 0x3FF) << 1)
+    )
+
+
+def ppc_bl(pc, target):
+    disp = target - pc
+    return (18 << 26) | (((disp >> 2) & 0xFFFFFF) << 2) | 1
+
+
+def ppc_ha_lo(delta):
+    lo = ((delta + 0x8000) & 0xFFFF) - 0x8000
+    ha = (delta - lo) >> 16
+    return ha, lo
+
+
+def ppc_prefix_pair(suffix_op, rd, ra, imm, rbit):
+    imm34 = imm + (1 << 34) if imm < 0 else imm
+    hi = (imm34 >> 16) & 0x3FFFF
+    lo = imm34 & 0xFFFF
+    prefix = (1 << 26) | ((rbit & 1) << 20) | hi
+    suffix = ((suffix_op & 0x3F) << 26) | ((rd & 31) << 21) | ((ra & 31) << 16) | lo
+    return prefix, suffix
+
+
+def asm(endian, *ops):
+    """Encode ops at 0x1000. A callable is invoked with its PC. A tuple is a prefix."""
+    words = []
+    pc = 0x1000
+    for op in ops:
+        produced = op(pc) if callable(op) else op
+        if isinstance(produced, tuple):
+            words.extend(produced)
+            pc += 4 * len(produced)
+        else:
+            words.append(produced)
+            pc += 4
+    return ppc_words(endian, *words)
+
+
+_PPC_MTCTR = 0x7D8903A6
+_PPC_BCTR = 0x4E800420
+# .got at 0x10000, so the TOC base the scanner uses is .got + 0x8000.
+_PPC_TOC = 0x18000
+
+
+def ppc_toc_stub(got):
+    ha, lo = ppc_ha_lo(got - _PPC_TOC)
+    return (
+        ppc_ds(62, 2, 1, 24),
+        ppc_d(15, 12, 2, ha),
+        ppc_ds(58, 12, 12, lo),
+        _PPC_MTCTR,
+        _PPC_BCTR,
+    )
+
+
+def ppc_pcrel_stub(pc, got):
+    return ppc_prefix_pair(57, 12, 0, got - pc, 1) + (_PPC_MTCTR, _PPC_BCTR)
+
+
+def ppc_toc_plt(endian, count):
+    blob = b""
+    for i in range(count):
+        raw = ppc_words(endian, *ppc_toc_stub(0x3100 + 8 * i))
+        if i + 1 < count:
+            raw += b"\0" * 12
+        blob += raw
+    return blob
+
+
+def ppc_elf(text, rodata, plt, symbols, relatives=None, extra=(), endian="little", toc=True):
+    """ppc64/ppc64le object. TOC stubs live in .plt so the call scan does not execute them."""
+    parts = [(".text", SHT_PROGBITS, 6, 0x1000, 0, text)]
+    if rodata:
+        parts.append((".rodata", SHT_PROGBITS, 2, 0x2000, 0, rodata))
+    parts.extend(extra)
+    if toc:
+        parts.append((".got", SHT_PROGBITS, 3, 0x10000, 0, b"\0" * 8))
+    parts.append((".plt", SHT_PROGBITS, 6, 0x3000, 0, plt))
+    relas = [(0x3100 + 8 * i, i + 1) for i in range(len(symbols))]
+    return build_elf(
+        EM_PPC64,
+        parts,
+        [(name, 0, 0) for name in symbols],
+        relas,
+        relatives,
+        endian=endian,
+        relative_type=22,
+    )
+
+
+def _unpack_sections(text, names):
+    raw = zlib.decompress(base64.b64decode(text))
+    out = {}
+    pos = 0
+    for name in names:
+        addr, size = struct.unpack_from("<QI", raw, pos)
+        pos += 12
+        out[name] = (addr, raw[pos:pos + size])
+        pos += size
+    return out
+
+
+_PPC64LE_FIXTURE = (
+    "eNq9U89rE0EUfpMNEgQh9NSLdXvR6GHb40gqREGJaMNK6aG33W6mdc2PjclWImzcjagoKNTbnkqCEjzmT2io4jVX"
+    "b/UWycFKDgYCxjfJJI2yFkHwwbLzfe/tfN97M1s7RYCHKgGE4PaK9uwabYQiTmdYHxwNWwMyXOwPh5srCajH30GN"
+    "Rgnpq5WDeLn7xo2QPVoJQXIernYANFruvnWrAu8ilqFK/YUFJ4pr/1zY8fgbMa/1L4CzLmo/wyNKwKMbAs8JDKg3"
+    "4ZKwh5yGTw35fVrufXTR9uXViT5ZpFEgHfTcRe/dhhRxZPBSMBO8P+/pr/19+zHur416Udy7jX3K2GMMWnG1YlD/"
+    "vOTsY85fOuvw9SEYzwExn8UR6H65d+D6X8H5RMY+JD6H3ntXg/ogBvouEI3eBb3Je2aiJvoXXjE07rf9ZOyXe30t"
+    "zuIe6ntA+okZjzf5rHGmOveK2P8OzobQm+gC4TPV6Bx6x/4Gy1Bt8jOSQe9fuph2KL5bMK7lffEz+CBwAY49n+RX"
+    "Fn5b6FVFj9xvU8x24nV0L5bCTg05X5Gm9+G60EoIrSCdCBy6kwdr+wQeX5n3Xn5pSC8qcthLTTg5gIsFcMsBHA3g"
+    "EgFcMoBTZzj1dGjkuYm/2HqJFeHOLfZwjd3fYXmDgVXcVjJpprCynitkGdww89usWCiaeXvVSrMspCzb3DIN3Tat"
+    "/BqzbcyXpl8VsnoppysZI6fs4NbHCY62GEtv6kaGp+EPQeDk+C0/1S2aD3Sb8Z1LStayMno+jXLZ4IL8TAul0T4S"
+    "/GMQ+D9xJiTuG8ar8fonsN1ckA=="
+)
+_PPC64LE_RELAS = [(0x30d18, 1), (0x30d20, 2), (0x30d28, 3), (0x30d30, 4), (0x30d38, 5), (0x30d40, 6), (0x30d48, 7), (0x30d50, 8)]
+_PPC64LE_RELS = [(0x20ad8, 0x20a72), (0x20ae8, 0x20a72), (0x20af8, 0x20a55), (0x20b90, 0x20b31), (0x20ba0, 0x20a83)]
+
+_PPC64_FIXTURE = (
+    "eNq9Uz1oU1EYPTcRDIIgnTomW80QOj5pC3ZQItISqR2FvL7clkfSvPxVXiFpXuwSQSFjpvJKpWSMmw5CQgUduwiO"
+    "dYtkEbI8CFjPTZpY9GkHwQ/Cud/57v2+c95HHl8XULEYBMqhwLEX+f7aEyK5uHF+PjwU2sIhGpqL1rAr7i6cVBLV"
+    "o76tHYhQHIF8bxmzWhKovurbzHdU3ttDU6sh5+mo89wgOsQ60SY6xJx6w/v3Ru/38EVzIJg/uMhnVM6ZmHIHiPON"
+    "4oTW4bwPA/sORvUlVe9TW59atYhI9ARulUPB41UHYVyK37wpP11qoTfNqCTq+zhr1oTW28dnrybmiafEOeLHnoEO"
+    "z2HqgqeL2erJgH7Fpwv/wer7gd1Qvlijv5aWFGjraI99iicTjVfrO1/2BE6VPs7KU5s57LIP9dG3Xt4PR8tHc9Hy"
+    "yXy0bmC3yVleDa53iKbXRYOz1tUsoj7S5ggoDe0aHHpVe5y52E2Ofe1y6nZU7SkOvFX3la/xLvBurJmzI+hcoTlP"
+    "ze5IM3Xye72hpjqxTXSILX4/l2d7Mnv8XTDefwSNP/WvniE0+Xm8u/QM4usLx648V3evhS9xjg9X9+EaPlzTh3N9"
+    "uJYP155w324ERprb/DutF2UBjx7K3TWZ35FZQ8IqbMXSKRmTtr6dy0jcN7NbspArmNnSipWSGaxaJXPTNPSSaWXX"
+    "ZKnEenH6KpfRi9t6LG1sx3bY+mdBZZtSpjZ0I63K8A+Bv8ev9encgvlUL0nVuRjLWFZaz6Y4LuN/IXvJQnHSKoh/"
+    "CIH/E+7N8e5CEyLw0v0B6bJlCw=="
+)
+_PPC64_RELAS = [(0x30e18, 1), (0x30e20, 2), (0x30e28, 3), (0x30e30, 4), (0x30e38, 5), (0x30e40, 6), (0x30e48, 7), (0x30e50, 8)]
+_PPC64_RELS = [(0x20b78, 0x20b12), (0x20b88, 0x20b12), (0x20b98, 0x20af5), (0x20c30, 0x20bd1), (0x20c40, 0x20b23)]
+
+_PPC64_ELFV2_FIXTURE = (
+    "eNq9U01oE0EU/iYRCYJQeupxCx5iDiHHlVaIghJQy0opeFDIdjMtSzY/TbaSwqbZGJUULFTwkFNpqJQec/TYEMUe"
+    "e+wxHoSVXIRcFnKIbzY/hrKIIPhg+ea9NzPf971hP1xnEPE8CCw/RkC+/9awQoGTQXPoDNrDn+7ikC2vD4dLTcTl"
+    "I5y6jM0tdcqKfMhCleNeKYHAnnMPC3ISqHz08n2RO7toyFVIrgqZ1geEMcI6YZjQJpTEGdr/wju/i2+yDUa5Os7n"
+    "RU6cmNYOkaAzosbkM+L72i/dgddf8/qLDA7DnBUKnvRIe488rNiQMBMjj2/qnscZf56vNmkij7JWVuo1dBtVOE4N"
+    "l24VXcILwkvCc0fDGa0vSB/Ix3ml0yff7Pt4DsHK537pQPijHvWfyUmGlorkyC/L+Gn11/m6O6PzvdBJnFukUXcZ"
+    "bKGT5qBaNSliHYcjVicWqWvYaRAn6VPcJhJuG3Hi9GZMqHvcNoPQ0qoiRp7Fu86P30oatBG2Urcj4t0SQFvsF/5G"
+    "b4MvI+3I/4X2W0I76W6TVsXTTnppfp9Im0zYIowRntI8j2gdnmgYzQkPxlzxCddVnkoXocnn0t67r8B+vLMXynti"
+    "7zVppib51MI+tZhPTfapxX1qCZ+aMqkpNwKe5hb9bmtFXsDTR3xnlW9t86zGkStsRtMpHuUlNZM3OB7q2U1eyBf0"
+    "rPkkl+IGVnKmvqFrqqnnsqvcNKlfnJ7KG2oxo0bTWia6TVf/bohsg/PUuqqlRRv+wfDnuNqf8hb0l6rJxc3FqJHL"
+    "pdVsiugM/w3ZGQvFyVVB/EMw/Ke4OXq70CQP7OMX8cNvEw=="
+)
+_PPC64_ELFV2_RELAS = [(0x30d18, 1), (0x30d20, 2), (0x30d28, 3), (0x30d30, 4), (0x30d38, 5), (0x30d40, 6), (0x30d48, 7), (0x30d50, 8)]
+_PPC64_ELFV2_RELS = [(0x20ad8, 0x20a72), (0x20ae8, 0x20a72), (0x20af8, 0x20a55), (0x20b90, 0x20b31), (0x20ba0, 0x20a83)]
+
+_PPC64LE_P10_FIXTURE = (
+    "eNq9U89rE0EUfrMTSvAU/4PkUKgHQxGElV4iUkkRC1K9Z0ymdUmyG5ONrFDJxot6S2/FU4QaeszVW4IechEKIgS8"
+    "VKRQWA8Rewgsun6ziTXEmgiCD5Z587734/vesJ0FRsoynKilRbcPgqt+PxD+YVD3j4MX/iDo+jFiw4/fE8M0dVcY"
+    "xRb2Iq6+T03d+fq6dlGjNKrhv6kprMebYY7D3fB8zDPhuRZJrSSQCz/ymVMvTnVd1V0mdqJiPcQW4X9jlHbeXUMv"
+    "Vz+PfOdDNvQJ80b1mOXtIdZErKM7n57UQP/KIrA4S+jgegzOXotHt8Hfgw4Pejzo8uLkrtOEKb0/9X2BPsWjAR6K"
+    "7y7PPF2CXqKR1qMxT+ypNyCxq7S/R+wt+PKx/iUSjQMSeobEkFhGv0eirTReQE5sits0F/UEk3x2ghGf5xr1gEXW"
+    "iPXVvY77KuZW0XMHHzE33GMKXJep3lZ7jWM+uPuq7hKJEx33l4RdgrPa5Sv4Jfo7PopLd8zltvb7uy1ro3dbRc/U"
+    "uOdZ/aJ0WNOQH4+4Ry3+7BHO6Xmk8OgcfMBn4/05eGcOvj8Hb8zBnRm4e04LzzZ+uTsVWaZbN+TDDXm/Ks2sJKu8"
+    "lcznZFI6olgqSLpumFuyXCobpn3TyskCrVu2sWlkhW1Y5oa0beCV06pSQVSKIpnPFpNVtP4FqNumlLm7IptXMP3B"
+    "GM22Kfx0btl4IGypOleSBcvKCzOHcYWzE8wJCZWwD6d/NEb/3X4AQ50k4A=="
+)
+_PPC64LE_P10_RELAS = [(0x30d40, 1), (0x30d48, 2), (0x30d50, 3), (0x30d58, 4), (0x30d60, 5), (0x30d68, 6), (0x30d70, 7), (0x30d78, 8)]
+_PPC64LE_P10_RELS = [(0x20b08, 0x20aa2), (0x20b18, 0x20aa2), (0x20b28, 0x20a85), (0x20bc0, 0x20b61), (0x20bd0, 0x20ab3)]
+
+_PPC64_P10_FIXTURE = (
+    "eNq9U0FrE0EU/mZ3KcFT/AfJoaAHQxGElV4iUkkRC1K975hM65JkNyYbWaGyGy/qLb0VTxVq6TFXbwl6yEUoiBDw"
+    "UpFCYT1E2kNh0fVNsraxjY0g9MEy8+Z7733fN8O2pxhkGCqwklA2wxvRdsijXtiIdsLX0V7YifqHDMnD9M8vsx3k"
+    "ppJguq9t6OvY8t7tuzkoV3QD8N7vuxKbXVe7g9VXh7mhPhusWW2eatMa7btQv+kNpGTfAcO1+KxL++kc2A/v5kdX"
+    "98Go/qKX/zzYEx9kP/UwbyNwKWd6m3iff3WvY4BN62mW2iOtAWleSaibAekPyEdAfgLyteAjhZEY+D329z3W0ZR6"
+    "XxjqGvm9RNyQXknbbowbaxx96Z3OPpHeD6RJlf6bnOo5tg85DN1gaHE8lB6p5jJpS45qO6nFOKUnWh3yKa80wnoM"
+    "83HeIN45mlmnb1X3GSQHac22GpiR90r8qZC0y74DjquU6zngjdQ8vFe81dOo/IueWEsn5r53+t2UmeG7YY5mZuXM"
+    "cfO8HSSoXtn1tdTTlxLX/sBlxHjibFztT8B7E/D2BHxrAt6cgLt/w/0LymBt0S93vyaquHtbPFkUj+rCygvY1eVM"
+    "sSAywuXlSknglmkti2qlalrOHbsgSliwHXPJzHPHtK1F4TiE1466KiVeK/NMMV/O1Gn0MSCzJSEKD3i+KGGMD4az"
+    "4yR+xFs1H3NHyMm1TMm2i9wqEF1pfIE1YqH2e5SK/wiG849foQUk4A=="
+)
+_PPC64_P10_RELAS = [(0x30d40, 1), (0x30d48, 2), (0x30d50, 3), (0x30d58, 4), (0x30d60, 5), (0x30d68, 6), (0x30d70, 7), (0x30d78, 8)]
+_PPC64_P10_RELS = [(0x20b08, 0x20aa2), (0x20b18, 0x20aa2), (0x20b28, 0x20a85), (0x20bc0, 0x20b61), (0x20bd0, 0x20ab3)]
+
+
+_PPC_SYMBOLS = [
+    "memcpy", "qmlregister", "qmlProtectModule", "qmlRegisterModule",
+    "qmlRegisterUncreatableMetaObject", "memset", "make_object", "touch",
+]
+_PPC_SECTIONS = (".text", ".data.rel.ro", ".got")
+
+
+class PowerPCTests(unittest.TestCase):
+    """Call scanner for big-endian ppc64 and little-endian ppc64le.
+
+    Medium code addresses a URI with addis/addi from r2. r2 is .got+0x8000,
+    which is also where the ELFv2 global-entry prologue puts it. Power10
+    uses paddi/pld @pcrel and has no TOC. The Clang fixtures are embedded
+    so the check does not need a PowerPC compiler.
+    """
+
+    def test_branch_and_prefix_immediates_roundtrip(self):
+        # bl from the ppc64le Clang fixture, and a backward branch.
+        self.assertEqual(qd._ppc_branch(0x4800027D, 0x106D4), (0x10950, 1))
+        self.assertEqual(qd._ppc_branch(ppc_bl(0x1008, 0x3000), 0x1008), (0x3000, 1))
+        self.assertEqual(qd._ppc_branch(ppc_bl(0x2000, 0x1000), 0x2000), (0x1000, 1))
+        # paddi r4, 0, 66724, 1 at 0x106e4. PC + imm lands on a URI.
+        self.assertEqual(qd._ppc_prefix_imm(0x06100001, 0x388004A4), 0x104A4)
+        self.assertEqual(0x106E4 + 0x104A4, 0x20B88)
+
+    def _protect(self, endian):
+        ha, lo = ppc_ha_lo(0x2000 - _PPC_TOC)
+        text = asm(
+            endian,
+            ppc_d(15, 3, 2, ha),
+            ppc_d(14, 3, 3, lo),
+            lambda pc: ppc_bl(pc, 0x3000),
+        )
+        elf = ppc_elf(
+            text, b"org.kde.example\0", ppc_toc_plt(endian, 1), [QMLPROTECT], endian=endian
+        )
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.example"})
+
+    def test_little_endian_protect_module_from_the_toc(self):
+        self._protect("little")
+
+    def test_big_endian_protect_module_from_the_toc(self):
+        self._protect("big")
+
+    def _stack_uri(self, endian):
+        ha, lo = ppc_ha_lo(0x2000 - _PPC_TOC)
+        text = asm(
+            endian,
+            ppc_d(15, 30, 2, ha),
+            ppc_d(14, 30, 30, lo),
+            ppc_ds(58, 3, 30, 0),
+            ppc_ds(58, 4, 30, 8),
+            ppc_ds(62, 3, 1, 0x20),
+            ppc_ds(62, 4, 1, 0x28),
+            ppc_d(14, 5, 1, 0x20),
+            ppc_ds(62, 5, 1, 0x40),
+            ppc_d(14, 6, 0, 0x100),
+            ppc_d(44, 6, 1, 0x48),
+            ppc_d(14, 3, 0, 0),
+            ppc_d(14, 4, 1, 0x40),
+            lambda pc: ppc_bl(pc, 0x3000),
+        )
+        elf = ppc_elf(
+            text, b"org.kde.example\0", ppc_toc_plt(endian, 1), [QMLREGISTER], endian=endian
+        )
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.example"})
+
+    def test_little_endian_stack_uri_is_captured_before_the_register_is_reused(self):
+        self._stack_uri("little")
+
+    def test_big_endian_stack_uri_is_captured_before_the_register_is_reused(self):
+        self._stack_uri("big")
+
+    def _uncreatable(self, endian):
+        ha, lo = ppc_ha_lo(0x2000 - _PPC_TOC)
+        text = asm(
+            endian,
+            ppc_d(15, 3, 2, ha),
+            ppc_d(14, 4, 3, lo),
+            ppc_d(14, 7, 3, lo + 25),
+            ppc_d(14, 3, 0, 1),
+            lambda pc: ppc_bl(pc, 0x3000),
+        )
+        ro = b"org.kde.plasma.kcm.users\0User\0"
+        elf = ppc_elf(text, ro, ppc_toc_plt(endian, 1), [QMLUNCREATABLE], endian=endian)
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.plasma.kcm.users"})
+
+    def test_little_endian_uncreatable_reads_the_uri_not_the_type_name(self):
+        self._uncreatable("little")
+
+    def test_big_endian_uncreatable_reads_the_uri_not_the_type_name(self):
+        self._uncreatable("big")
+
+    def _memcpy_image(self, endian):
+        note = b"org.kde.private.kcms.notifications\0"
+        meta = b"NotificationSettings\0"
+        image = bytearray(0x60)
+        # QTypeRevision is a uint16 at the low address, then six zero bytes.
+        # Big-endian is 01 00 00 00 00 00 00 00, not a big-endian uint64.
+        image[0x40:0x48] = (0x100).to_bytes(2, endian) + b"\0" * 6
+        ha, lo = ppc_ha_lo(0x4000 - _PPC_TOC)
+        text = asm(
+            endian,
+            ppc_d(15, 4, 2, ha),
+            ppc_d(14, 4, 4, lo),
+            ppc_d(14, 3, 1, 0x20),
+            ppc_d(14, 5, 0, 0x60),
+            lambda pc: ppc_bl(pc, 0x3000),
+            ppc_d(14, 3, 0, 0),
+            ppc_d(14, 4, 1, 0x20),
+            lambda pc: ppc_bl(pc, 0x3020),
+        )
+        elf = ppc_elf(
+            text,
+            note + meta,
+            ppc_toc_plt(endian, 2),
+            ["memcpy", QMLREGISTER],
+            [(0x4038, 0x2000), (0x4048, 0x2000 + len(note))],
+            extra=[(".data.rel.ro", SHT_PROGBITS, 3, 0x4000, 0, bytes(image))],
+            endian=endian,
+        )
+        found = qd.cpp_qml_modules(elf)
+        self.assertEqual(found, {"org.kde.private.kcms.notifications"})
+        self.assertNotIn("NotificationSettings", found)
+
+    def test_little_endian_memcpy_image_skips_a_metaobject_name(self):
+        self._memcpy_image("little")
+
+    def test_big_endian_memcpy_image_skips_a_metaobject_name(self):
+        self._memcpy_image("big")
+
+    def test_little_endian_vector_copy_skips_a_metaobject_name(self):
+        note = b"org.kde.private.kcms.notifications\0"
+        meta = b"NotificationSettings\0"
+        image = bytearray(32)
+        image[16:24] = (0x100).to_bytes(8, "little")
+        ha, lo = ppc_ha_lo(0x4000 - _PPC_TOC)
+        text = asm(
+            "little",
+            ppc_d(15, 30, 2, ha),
+            ppc_d(14, 30, 30, lo),
+            ppc_d(14, 5, 0, 0),
+            ppc_x(844, 0, 30, 5),
+            ppc_d(14, 5, 0, 16),
+            ppc_x(844, 1, 30, 5),
+            ppc_d(14, 5, 0, 0),
+            ppc_x(972, 0, 1, 5),
+            ppc_d(14, 5, 0, 16),
+            ppc_x(972, 1, 1, 5),
+            ppc_d(14, 3, 0, 0),
+            ppc_d(14, 4, 1, 0),
+            lambda pc: ppc_bl(pc, 0x3000),
+        )
+        elf = ppc_elf(
+            text,
+            note + meta,
+            ppc_toc_plt("little", 1),
+            [QMLREGISTER],
+            [(0x4000, 0x2000 + len(note)), (0x4008, 0x2000)],
+            extra=[(".data.rel.ro", SHT_PROGBITS, 3, 0x4000, 0, bytes(image))],
+        )
+        found = qd.cpp_qml_modules(elf)
+        self.assertEqual(found, {"org.kde.private.kcms.notifications"})
+        self.assertNotIn("NotificationSettings", found)
+
+    def _pcrel(self, endian):
+        text = asm(
+            endian,
+            lambda pc: ppc_prefix_pair(14, 3, 0, 0x2000 - pc, 1),
+            lambda pc: ppc_bl(pc, 0x3000),
+        )
+        plt = ppc_words(endian, *ppc_pcrel_stub(0x3000, 0x3100))
+        elf = ppc_elf(
+            text, b"org.kde.example\0", plt, [QMLPROTECT], endian=endian, toc=False
+        )
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.example"})
+
+    def test_little_endian_pcrel_protect_module(self):
+        self._pcrel("little")
+
+    def test_big_endian_pcrel_protect_module(self):
+        self._pcrel("big")
+
+    def test_clang_fixtures_provide_registered_modules_only(self):
+        expect = {
+            "FingerprintModel",
+            "QKeySequence",
+            "org.kde.example",
+            "org.kde.plasma.kcm.users",
+            "org.kde.private.kcms.lookandfeel",
+            "org.kde.private.kcms.notifications",
+            "org.kde.userfeedback.kcm",
+        }
+        cases = (
+            ("little", _PPC64LE_FIXTURE, _PPC64LE_RELAS, _PPC64LE_RELS),
+            ("big", _PPC64_FIXTURE, _PPC64_RELAS, _PPC64_RELS),
+            ("big", _PPC64_ELFV2_FIXTURE, _PPC64_ELFV2_RELAS, _PPC64_ELFV2_RELS),
+            ("little", _PPC64LE_P10_FIXTURE, _PPC64LE_P10_RELAS, _PPC64LE_P10_RELS),
+            ("big", _PPC64_P10_FIXTURE, _PPC64_P10_RELAS, _PPC64_P10_RELS),
+        )
+        for endian, packed, relas, relatives in cases:
+            secs = _unpack_sections(packed, _PPC_SECTIONS)
+            parts = []
+            for name, (addr, blob) in secs.items():
+                if not addr and not blob:
+                    continue
+                flags = 6 if name == ".text" else 3
+                parts.append((name, SHT_PROGBITS, flags, addr, 0, blob))
+            elf = build_elf(
+                EM_PPC64,
+                parts,
+                [(name, 0, 0) for name in _PPC_SYMBOLS],
+                relas,
+                relatives,
+                endian=endian,
+                relative_type=22,
+            )
+            found = qd.cpp_qml_modules(elf)
+            self.assertEqual(found, expect)
+            self.assertNotIn("NotificationSettings", found)
+            self.assertNotIn("User", found)
+            self.assertNotIn("KCMLookandFeel", found)
 
 class InstalledCppTests(unittest.TestCase):
     def test_notifications_provides_the_module_it_imports(self):

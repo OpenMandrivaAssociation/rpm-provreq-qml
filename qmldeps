@@ -1233,6 +1233,11 @@ def _call_targets(elf):
     for name, (kind, value, defined) in names.items():
         if defined and value:
             targets[value] = kind
+    # ppc64 stubs live in .text (the .plt section is NOBITS) and the
+    # instruction words are big-endian on ppc64, little-endian on ppc64le.
+    if elf.cls == 2 and elf.machine == 21:
+        _ppc_add_stubs(elf, targets)
+        return targets
     rela = elf.section(".rela.plt")
     plt = elf.section(".plt")
     if rela is None or plt is None or elf.cls != 2 or not elf.le:
@@ -1328,18 +1333,23 @@ def _aarch64_plt_stub(plt, plt_addr, got):
 
 
 def _modules_from_calls(elf):
-    if elf.cls != 2 or not elf.le or elf.machine not in (62, 183, 243, 258):
+    if elf.cls != 2 or elf.machine not in (21, 62, 183, 243, 258):
+        return set()
+    # ppc64 is the one big-endian machine. The others are little-endian only.
+    if not elf.le and elf.machine != 21:
         return set()
     targets = _call_targets(elf)
     if not targets:
         return set()
     found = set()
-    relocs = _relative_relocs(elf) if elf.machine in (243, 258) else {}
+    relocs = _relative_relocs(elf) if elf.machine in (21, 243, 258) else {}
     for base, blob in elf.exec_ranges():
         if elf.machine == 62:
             found.update(_x86_call_modules(elf, blob, base, targets))
         elif elf.machine == 183:
             found.update(_aarch64_call_modules(elf, blob, base, targets))
+        elif elf.machine == 21:
+            found.update(_ppc_call_modules(elf, blob, base, targets, relocs))
         elif elf.machine == 243:
             found.update(_riscv_call_modules(elf, blob, base, targets, relocs))
         else:
@@ -2730,16 +2740,22 @@ def _bits(val, hi, lo):
     return (val >> lo) & ((1 << (hi - lo + 1)) - 1)
 
 
-def _relative_relocs(elf):
-    """Map vaddr -> addend for R_*_RELATIVE (type 3) entries.
+# R_*_RELATIVE: RISC-V and LoongArch use 3, PowerPC64 uses 22.
+_RELATIVE_TYPE = {21: 22, 243: 3, 258: 3}
 
-    RISC-V and LoongArch clang leave a zero in the file and put the
-    target vaddr in r_addend. The existing relocations() helper drops
-    the addend; callers of that 3-tuple are unchanged.
+
+def _relative_relocs(elf):
+    """Map vaddr -> addend for R_*_RELATIVE entries.
+
+    Clang leaves a zero in the file and puts the target vaddr in
+    r_addend. The existing relocations() helper drops the addend;
+    callers of that 3-tuple are unchanged.
     """
+    rtype = _RELATIVE_TYPE.get(elf.machine)
     found = {}
-    if elf.cls != 2 or not elf.le:
+    if elf.cls != 2 or rtype is None:
         return found
+    fmt = "<QQq" if elf.le else ">QQq"
     for sec in elf.sections:
         if sec["type"] != 4 or not sec["size"]:
             continue
@@ -2747,8 +2763,8 @@ def _relative_relocs(elf):
         blob = elf.data
         for i in range(sec["size"] // step):
             off = sec["offset"] + i * step
-            r_offset, r_info, r_addend = struct.unpack_from("<QQq", blob, off)
-            if (r_info & 0xFFFFFFFF) == 3 and r_addend > 0:
+            r_offset, r_info, r_addend = struct.unpack_from(fmt, blob, off)
+            if (r_info & 0xFFFFFFFF) == rtype and r_addend > 0:
                 found[r_offset] = r_addend
     return found
 
@@ -3469,6 +3485,406 @@ def _loongarch_call_modules(elf, blob, base, targets, relocs):
         else:
             # Integer ops write rd. Stores and branches were handled above,
             # so this does not drop the source of an st.d.
+            _gpr_clear(st, rd)
+        off += 4
+    return found
+
+
+# PowerPC64 caller-saved GPRs. r1 is SP, r2 is the TOC (the call stub
+# restores it), r13 is the thread pointer, r14-r31 are callee-saved.
+_PPC_CALLERS = {0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+_PPC_MTCTR_R12 = 0x7D8903A6
+_PPC_BCTR = 0x4E800420
+
+
+def _ppc_toc(elf):
+    """Medium-model TOC base. Stripped objects keep .got, not the .TOC. symbol."""
+    for name, value, defined in elf.symbols():
+        if name == b".TOC." and defined and value:
+            return value
+    got = elf.section(".got")
+    if got is not None and got["addr"]:
+        return got["addr"] + 0x8000
+    return None
+
+
+def _ppc_plt_kinds(elf):
+    """Map a .rela.plt GOT slot to a registration kind."""
+    dynsym = elf.section(".dynsym")
+    dynstr = elf.section(".dynstr")
+    if dynsym is None or dynstr is None or elf.section(".rela.plt") is None:
+        return {}
+    entsize = dynsym["entsize"] or 24
+    strings = elf.data[dynstr["offset"]:dynstr["offset"] + dynstr["size"]]
+    names = []
+    for i in range(dynsym["size"] // entsize):
+        off = dynsym["offset"] + i * entsize
+        st_name = elf.u32(elf.data, off)
+        if st_name >= len(strings):
+            names.append(b"")
+            continue
+        end = strings.find(b"\0", st_name)
+        names.append(strings[st_name:end if end >= 0 else st_name])
+    kinds = {}
+    for _index, got, symi in elf.relocations(".rela.plt"):
+        if symi >= len(names):
+            continue
+        kind = _registration_kind(names[symi])
+        if kind:
+            kinds[got] = kind
+    return kinds
+
+
+def _ppc_u32(blob, off, le):
+    return int.from_bytes(blob[off:off + 4], "little" if le else "big")
+
+
+def _ppc_insns(blob, base, le):
+    """Yield (off, pc, word, suffix). suffix is set for an 8-byte prefix."""
+    off = 0
+    while off + 4 <= len(blob):
+        word = _ppc_u32(blob, off, le)
+        pc = base + off
+        if (word >> 26) == 1 and off + 8 <= len(blob):
+            yield off, pc, word, _ppc_u32(blob, off + 4, le)
+            off += 8
+        else:
+            yield off, pc, word, None
+            off += 4
+
+
+def _ppc_ds(word):
+    disp = _sext((word >> 2) & 0x3FFF, 14) << 2
+    return (word >> 26), (word >> 21) & 31, (word >> 16) & 31, disp, word & 3
+
+
+def _ppc_prefix_imm(prefix, suffix):
+    # Bits 14:31 of the prefix are the high 18 bits of a 34-bit immediate.
+    # The suffix holds the low 16. One signed field, not a @ha/@l pair.
+    return _sext(((prefix & 0x3FFFF) << 16) | (suffix & 0xFFFF), 34)
+
+
+def _ppc_branch(word, pc):
+    disp = _sext((word >> 2) & 0xFFFFFF, 24) << 2
+    aa = (word >> 1) & 1
+    lk = word & 1
+    return (disp if aa else pc + disp), lk
+
+
+def _ppc_add_stubs(elf, targets):
+    """lld puts the PLT stub in .text, not in the NOBITS .plt.
+
+    Power8/9: std r2, 24(r1); addis r12, r2, ha; ld r12, lo(r12); mtctr; bctr.
+    The GOT slot is TOC + ha + lo. Power10: pld r12, got@pcrel; mtctr; bctr.
+    """
+    kinds = _ppc_plt_kinds(elf)
+    if not kinds:
+        return
+    toc = _ppc_toc(elf)
+    le = elf.le
+    for sec in elf.sections:
+        if sec["type"] == 8 or not sec["size"] or not (sec["flags"] & 4):
+            continue
+        blob = elf.data[sec["offset"]:sec["offset"] + sec["size"]]
+        insns = list(_ppc_insns(blob, sec["addr"], le))
+        for index, (off, pc, word, suf) in enumerate(insns):
+            if suf is None and index + 4 < len(insns) and toc is not None:
+                ops = [insns[index + n][2] for n in range(5)]
+                if any(insns[index + n][3] is not None for n in range(5)):
+                    continue
+                op, rs, ra, disp, xo = _ppc_ds(ops[0])
+                addis, ld = ops[1], ops[2]
+                if not (
+                    op == 62 and xo == 0 and rs == 2 and ra == 1 and disp == 24
+                    and (addis >> 26) == 15
+                    and ((addis >> 21) & 31) == 12
+                    and ((addis >> 16) & 31) == 2
+                    and (ld >> 26) == 58
+                    and (ld & 3) == 0
+                    and ((ld >> 21) & 31) == 12
+                    and ((ld >> 16) & 31) == 12
+                    and ops[3] == _PPC_MTCTR_R12
+                    and ops[4] == _PPC_BCTR
+                ):
+                    continue
+                ha = _sext(addis & 0xFFFF, 16) << 16
+                lo = _ppc_ds(ld)[3]
+                got = toc + ha + lo
+                kind = kinds.get(got)
+                if kind:
+                    targets[pc] = kind
+                continue
+            if suf is None or index + 2 >= len(insns):
+                continue
+            # pld r12, disp@pcrel followed by mtctr r12; bctr.
+            if (
+                (suf >> 26) == 57
+                and ((suf >> 21) & 31) == 12
+                and ((suf >> 16) & 31) == 0
+                and ((word >> 20) & 1) == 1
+                and insns[index + 1][3] is None
+                and insns[index + 1][2] == _PPC_MTCTR_R12
+                and insns[index + 2][3] is None
+                and insns[index + 2][2] == _PPC_BCTR
+            ):
+                got = pc + _ppc_prefix_imm(word, suf)
+                kind = kinds.get(got)
+                if kind:
+                    targets[pc] = kind
+
+
+def _ppc_base_disp(st, ra, disp, sp):
+    """D-form/DS-form address. r0 as RA means zero, not the contents of r0."""
+    if ra == 0:
+        return None, None
+    if ra == sp:
+        return "slot", disp
+    kind, val = _gpr_read(st, ra, sp)
+    if kind == "slot":
+        return "slot", val + disp
+    if kind in ("addr", "page"):
+        return "addr", val + disp
+    return None, None
+
+
+def _ppc_indexed(st, ra, rb, sp):
+    """EA = (RA|0) + RB. One side is a base, the other an immediate offset."""
+    bk, bv = ("imm", 0) if ra == 0 else _gpr_read(st, ra, sp)
+    ik, iv = ("imm", 0) if rb == 0 else _gpr_read(st, rb, sp)
+    if ik == "imm" and bk in ("slot", "addr", "page"):
+        base, off = bk, iv
+        val = bv
+    elif bk == "imm" and ik in ("slot", "addr", "page"):
+        base, off = ik, bv
+        val = iv
+    else:
+        return None, None
+    if base == "slot":
+        return "slot", val + off
+    return "addr", val + off
+
+
+def _ppc_load_ea(elf, relocs, st, rd, ek, ev, width, sp):
+    if rd == 2 and ek == "slot" and ev == 24:
+        # ld r2, 24(r1) reloads the TOC the PLT stub saved. The save is in
+        # the stub, which this linear pass has not executed yet.
+        return
+    if ek == "addr" and width == 8 and ev in relocs:
+        _gpr_set_addr(st, rd, relocs[ev], sp)
+        return
+    raw = None
+    if ek == "addr":
+        raw = elf.bytes_at(ev, width)
+    elif ek == "slot" and all(ev + i in st["mem"] for i in range(width)):
+        raw = bytes(st["mem"][ev + i] for i in range(width))
+    if raw is not None and len(raw) == width:
+        _gpr_set_data(st, rd, raw, sp)
+    elif rd not in (0, 1):
+        _gpr_clear(st, rd)
+
+
+def _ppc_store_ea(st, rs, ek, ev, width, off, sp):
+    if ek == "slot":
+        _note_store(st, rs, ev, width, off, sp)
+
+
+def _ppc_vec_load(st, xt, ek, ev):
+    if ek == "addr":
+        st["vec"][xt] = ev
+    else:
+        st["vec"].pop(xt, None)
+
+
+def _ppc_vec_store(elf, st, xs, ek, ev):
+    src = st["vec"].get(xs)
+    if ek == "slot" and src is not None:
+        _mirror_span(elf, st, ev, src, 16)
+    elif ek == "slot":
+        _stack_wipe(st, ev, 16)
+
+
+def _ppc_prefixed_ea(st, prefix, suffix, pc, sp):
+    imm = _ppc_prefix_imm(prefix, suffix)
+    ra = (suffix >> 16) & 31
+    if (prefix >> 20) & 1:
+        extra = 0
+        if ra:
+            kind, val = _gpr_read(st, ra, sp)
+            if kind != "imm":
+                return None, None
+            extra = val
+        return "addr", pc + imm + extra
+    if ra == 0:
+        return "imm", imm
+    return _ppc_base_disp(st, ra, imm, sp)
+
+
+def _ppc_prefix(elf, relocs, st, prefix, suffix, pc, off, sp):
+    sop = suffix >> 26
+    rd = (suffix >> 21) & 31
+    ek, ev = _ppc_prefixed_ea(st, prefix, suffix, pc, sp)
+    if sop == 14:  # paddi
+        if ek == "addr":
+            _gpr_set_addr(st, rd, ev, sp)
+        elif ek == "slot":
+            _gpr_set_slot(st, rd, ev, sp)
+        elif ek == "imm":
+            _gpr_set_imm(st, rd, ev, sp)
+        elif rd not in (0, 1):
+            _gpr_clear(st, rd)
+    elif sop == 34:  # plbz
+        _ppc_load_ea(elf, relocs, st, rd, ek, ev, 1, sp)
+    elif sop == 57:  # pld
+        _ppc_load_ea(elf, relocs, st, rd, ek, ev, 8, sp)
+    elif sop == 50:  # plxv
+        _ppc_vec_load(st, rd, ek, ev)
+    elif sop == 54:  # pstxv
+        _ppc_vec_store(elf, st, rd, ek, ev)
+    elif sop == 61:  # pstd
+        _ppc_store_ea(st, rd, ek, ev, 8, off, sp)
+    elif rd not in (0, 1, 2):
+        _gpr_clear(st, rd)
+
+
+def _ppc_seed(st, toc, sp):
+    _reset_track(st)
+    if toc is not None:
+        _gpr_set_addr(st, 2, toc, sp)
+
+
+def _ppc_call_modules(elf, blob, base, targets, relocs):
+    """Modules from ppc64 and ppc64le registration calls.
+
+    ELFv2 (ppc64le, and ppc64 -mabi=elfv2) addresses a literal with
+    addis/addi from the TOC, or, at -mcpu=power10, with paddi @pcrel.
+    ELFv1 (the usual big-endian ABI) enters with r2 already the TOC and
+    has no global-entry prologue. Long URIs are copied with lxvd2x/stxv
+    or with ld/std. A RegisterType image in .data.rel.ro has zero pointer
+    slots; R_PPC64_RELATIVE carries the string address.
+    """
+    found = set()
+    toc = _ppc_toc(elf)
+    st = _new_track()
+    sp = 1
+    if toc is not None:
+        _gpr_set_addr(st, 2, toc, sp)
+    le = elf.le
+    off = 0
+    limit = len(blob)
+    while off + 4 <= limit:
+        word = _ppc_u32(blob, off, le)
+        pc = base + off
+        suf = None
+        if (word >> 26) == 1 and off + 8 <= limit:
+            suf = _ppc_u32(blob, off + 4, le)
+        if suf is not None:
+            _ppc_prefix(elf, relocs, st, word, suf, pc, off, sp)
+            off += 8
+            continue
+        op = word >> 26
+        rd = (word >> 21) & 31
+        ra = (word >> 16) & 31
+        simm = _sext(word & 0xFFFF, 16)
+        if op == 0:
+            pass
+        elif op == 14:  # addi / li
+            _addi_reg(st, rd, ra, simm, sp)
+        elif op == 15:  # addis / lis
+            # Global entry is `addis r2, r12, (.TOC.-func)@ha` and r12 is
+            # the address of that instruction. The local entry skips it.
+            if (
+                rd == 2
+                and ra == 12
+                and not any(12 in st[key] for key in ("addr", "page", "imm", "slot", "data"))
+            ):
+                _gpr_set_addr(st, 2, pc + (simm << 16), sp)
+            else:
+                _addi_reg(st, rd, ra, simm << 16, sp)
+        elif op == 24:  # ori. The immediate is zero-extended. ori r0, r0, 0 is nop.
+            uimm = word & 0xFFFF
+            if rd == 0:
+                pass
+            elif ra == 0:
+                _gpr_set_imm(st, rd, uimm, sp)
+            elif uimm == 0:
+                _gpr_copy(st, rd, ra, sp)
+            elif ra in st["imm"]:
+                _gpr_set_imm(st, rd, (st["imm"][ra] | uimm) & ((1 << 64) - 1), sp)
+            else:
+                _gpr_clear(st, rd)
+        elif op == 18:  # b / bl
+            dest, lk = _ppc_branch(word, pc)
+            if lk:
+                _finish_call(elf, relocs, st, targets, dest, found, 3, 4, sp, _PPC_CALLERS)
+            else:
+                _on_jump(st, dest - pc)
+        elif op == 19:  # blr / bctr
+            xo = (word >> 1) & 0x3FF
+            lk = word & 1
+            if xo in (16, 528) and not lk:
+                _ppc_seed(st, toc, sp)
+            elif xo in (16, 528) and lk:
+                _clobber_callers(st, _PPC_CALLERS)
+        elif op == 16:  # bc / bcl. A conditional arm falls through, so keep state.
+            bd = _sext((word >> 2) & 0x3FFF, 14) << 2
+            aa = (word >> 1) & 1
+            lk = word & 1
+            dest = bd if aa else pc + bd
+            if lk and dest in targets:
+                _finish_call(elf, relocs, st, targets, dest, found, 3, 4, sp, _PPC_CALLERS)
+        elif op in (34, 40, 42, 32):  # lbz, lhz, lha, lwz
+            width = {34: 1, 40: 2, 42: 2, 32: 4}[op]
+            ek, ev = _ppc_base_disp(st, ra, simm, sp)
+            _ppc_load_ea(elf, relocs, st, rd, ek, ev, width, sp)
+        elif op in (38, 44, 36):  # stb, sth, stw
+            width = {38: 1, 44: 2, 36: 4}[op]
+            ek, ev = _ppc_base_disp(st, ra, simm, sp)
+            _ppc_store_ea(st, rd, ek, ev, width, off, sp)
+        elif op in (58, 62):
+            _op, rs, rbase, disp, xo = _ppc_ds(word)
+            if op == 62 and rs == sp and rbase == sp:
+                pass  # stdu r1, -frame(r1). Offsets are already post-adjust.
+            elif op == 58 and xo == 0:
+                ek, ev = _ppc_base_disp(st, rbase, disp, sp)
+                _ppc_load_ea(elf, relocs, st, rs, ek, ev, 8, sp)
+            elif op == 62 and xo in (0, 1):
+                ek, ev = _ppc_base_disp(st, rbase, disp, sp)
+                _ppc_store_ea(st, rs, ek, ev, 8, off, sp)
+        elif op == 61 and (word & 0xF) == 5:  # stxv XS, DQ(RA)
+            dq = _sext((word >> 4) & 0xFFF, 12) << 4
+            ek, ev = _ppc_base_disp(st, ra, dq, sp)
+            _ppc_vec_store(elf, st, rd, ek, ev)
+        elif op == 31:
+            rs = rd
+            rb = (word >> 11) & 31
+            xo = (word >> 1) & 0x3FF
+            if xo == 444:  # or RA, RS, RB. mr is or RA, RS, RS. Dest is RA.
+                if rs == rb or rb == 0:
+                    _gpr_copy(st, ra, rs, sp)
+                elif rs == 0:
+                    _gpr_copy(st, ra, rb, sp)
+                else:
+                    _gpr_clear(st, ra)
+            elif xo == 21:  # ldx
+                ek, ev = _ppc_indexed(st, ra, rb, sp)
+                _ppc_load_ea(elf, relocs, st, rs, ek, ev, 8, sp)
+            elif xo == 149:  # stdx
+                ek, ev = _ppc_indexed(st, ra, rb, sp)
+                _ppc_store_ea(st, rs, ek, ev, 8, off, sp)
+            elif xo == 844:  # lxvd2x
+                ek, ev = _ppc_indexed(st, ra, rb, sp)
+                _ppc_vec_load(st, rs, ek, ev)
+            elif xo == 972:  # stxvd2x
+                ek, ev = _ppc_indexed(st, ra, rb, sp)
+                _ppc_vec_store(elf, st, rs, ek, ev)
+            elif xo == 339:  # mfspr / mflr
+                if rs not in (0, 1, 2):
+                    _gpr_clear(st, rs)
+            elif xo in (467, 4):  # mtspr / mtctr / mtlr, or trap
+                pass
+            elif rs not in (0, 1, 2):
+                _gpr_clear(st, rs)
+        elif rd not in (0, 1, 2):
             _gpr_clear(st, rd)
         off += 4
     return found
