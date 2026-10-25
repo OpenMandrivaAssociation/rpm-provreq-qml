@@ -1624,7 +1624,7 @@ def _x86_imm_store(blob, at):
         return None
     rex = 0
     pos = at
-    if 0x40 <= blob[pos] <= 0x47:
+    if 0x40 <= blob[pos] <= 0x4F:
         rex = blob[pos]
         pos += 1
         if pos >= len(blob):
@@ -1652,7 +1652,12 @@ def _x86_imm_store(blob, at):
     base, disp, next_at = mem
     if next_at + width > len(blob):
         return None
-    return base, disp, blob[next_at:next_at + width], next_at + width
+    raw = blob[next_at:next_at + width]
+    # REX.W + C7 is `mov r/m64, imm32`. The immediate stays 4 bytes and is
+    # sign-extended into the 8-byte store.
+    if (rex & 0x08) and width == 4:
+        raw = int.from_bytes(raw, "little", signed=True).to_bytes(8, "little", signed=True)
+    return base, disp, raw, next_at + width
 
 
 def _x86_gpr_rip_load(blob, base, at):
@@ -1853,7 +1858,9 @@ def _x86_stack_image(elf, blob, base, lo, hi):
             blob[at] == 0x66
             or blob[at] in (0xC6, 0xC7)
             or (
-                0x40 <= blob[at] <= 0x47
+                # 0x48-0x4F is REX.W. Dropping it makes `mov qword [r12+d], imm`
+                # look like `mov dword [rsp+d], imm` and overwrites a stack URI.
+                0x40 <= blob[at] <= 0x4F
                 and at + 1 < limit
                 and blob[at + 1] in (0xC6, 0xC7, 0x66)
             )

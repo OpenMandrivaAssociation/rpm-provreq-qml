@@ -810,6 +810,39 @@ class CppProvideTests(unittest.TestCase):
             {"org.kde.private.kcms.notifications"},
         )
 
+    def test_rexw_store_through_r12_does_not_clobber_stack_uri(self):
+        # kcm_keys on x86_64 copies the URI with overlapping movups/movaps,
+        # then zeroes a field of a struct at [rsp+0x60] with
+        # `mov qword ptr [r12+0x48], 0`. The REX.W prefix selects r12. Without
+        # it, that instruction is `mov dword ptr [rsp+0x48], 0` and splits the URI.
+        raw = b"org.kde.private.kcms.keys\0"
+        text = bytearray()
+        cursor = 0x1000
+
+        def emit(blob):
+            nonlocal cursor
+            text.extend(blob)
+            cursor += len(blob)
+
+        def sse_rip(opcode, target):
+            disp = target - (cursor + 7)
+            emit(bytes([0x0F, opcode, 0x05]) + struct.pack("<i", disp))
+
+        def sse_rsp(opcode, disp):
+            emit(bytes([0x0F, opcode, 0x44, 0x24, disp & 0xFF]))
+
+        sse_rip(0x10, 0x2000 + 10)  # movups xmm0, tail
+        sse_rsp(0x11, 0x4A)
+        sse_rip(0x28, 0x2000)  # movaps xmm0, head
+        sse_rsp(0x29, 0x40)
+        emit(b"\x4c\x8d\x64\x24\x60")  # lea r12, [rsp+0x60]
+        emit(b"\x49\xc7\x44\x24\x48\x00\x00\x00\x00")  # mov qword [r12+0x48], 0
+        emit(b"\x48\x8d\x7c\x24\x40")  # lea rdi, [rsp+0x40]
+        emit(b"\xbe\x02\x00\x00\x00")
+        emit(x86_call(cursor, 0x3000))
+        elf = self._protect_elf(bytes(text), raw)
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.private.kcms.keys"})
+
     def test_aligned_vex_copy_overlaps_on_the_stack(self):
         # clang -O2 for a longer `const char uri[]`. The aligned half is
         # vmovaps (opcode 28/29); the tail is an overlapping vmovups. Reading
