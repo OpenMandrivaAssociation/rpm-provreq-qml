@@ -270,6 +270,44 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(provides, [])
         self.assertEqual(requires, set())
 
+    def test_lowercase_helper_module_is_not_a_require(self):
+        # Qt examples: import shared as Examples. The helper plugin is not
+        # installed in a prefix build, so qml(shared) has no provider.
+        text = """\
+import QtQuick
+import shared as Examples
+import fbitem
+import chattutorial
+import org.kde.plasma.core
+"""
+        self.assertEqual(
+            qd.qml_imports(text),
+            {
+                "QtQuick",
+                "shared",
+                "fbitem",
+                "chattutorial",
+                "org.kde.plasma.core",
+            },
+        )
+        self.assertEqual(
+            qd.deps_from_texts([("animation.qml", text)], "requires"),
+            ["qml(QtQuick)", "qml(org.kde.plasma.core)"],
+        )
+        qmldir = "module shared\nLauncherList 2.0 LauncherList.qml\ndepends extrahelpers\n"
+        provides, requires = qd.parse_qmldir(qmldir)
+        self.assertIn("qml(shared) = 2.0", provides)
+        self.assertEqual(requires, {"extrahelpers"})
+        self.assertEqual(qd.deps_from_texts([("qmldir", qmldir)], "provides"), [
+            "qml(shared) = 2.0",
+            "qml(shared.LauncherList) = 2.0",
+        ])
+        self.assertEqual(qd.deps_from_texts([("qmldir", qmldir)], "requires"), [])
+        self.assertTrue(qd.external_qml_module("QtQuick"))
+        self.assertTrue(qd.external_qml_module("SddmComponents"))
+        self.assertTrue(qd.external_qml_module("org.kde.kirigami"))
+        self.assertFalse(qd.external_qml_module("shared"))
+
     def test_controls_optional_and_default_are_not_requires(self):
         text = (
             "module QtQuick.Controls\n"

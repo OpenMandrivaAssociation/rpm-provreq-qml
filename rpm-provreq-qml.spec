@@ -1,6 +1,6 @@
 Name:		rpm-provreq-qml
 Version:	6.2.0
-Release:	7
+Release:	8
 Summary:	RPM Provides/Requires generator for QML files
 Group:		Development/KDE and Qt
 BuildArch:	noarch
@@ -21,7 +21,9 @@ RPM Provides and Requires generator for QML files.
 Scans loose .qml and qmldir files, standalone .rcc resources, and QML
 embedded in ELF binaries by Qt's resource compiler. C++ modules registered
 with qmlRegisterType or qmltyperegistrar are provided too. Import
-requirements are unversioned qml(Module) names. RPM_QML_REQUIRES=0 skips
+requirements are unversioned qml(Module) names. A single all-lowercase
+module name is not required: Qt examples import helper modules such as
+shared, and a prefix build does not install them. RPM_QML_REQUIRES=0 skips
 requirements.
 
 %prep

@@ -13,6 +13,11 @@ module version recorded in qmldir (that file usually has none; the generator's
 Provides version is only the highest type version), and a versioned require
 does not match an unversioned provide.
 
+A single all-lowercase module name (shared, fbitem, chattutorial) is not a
+require. Qt examples import those from a helper plugin built beside the
+example, and a prefix build does not install that plugin, so nothing provides
+qml(shared). Public modules are dotted or contain an uppercase letter.
+
 qmldir "depends" and "import" lines are requirements. "optional import" is
 not: the engine does not load it automatically. "default import" only tells
 tooling which optional import to assume.
@@ -911,6 +916,21 @@ _NON_ALNUM = re.compile(r"[^A-Za-z0-9]")
 _REJECT_SUFFIX = (
     ".so", ".c", ".cc", ".cpp", ".h", ".hpp", ".qml", ".js", ".mjs", ".qm", ".utf8",
 )
+
+
+def external_qml_module(name):
+    """Whether an imported module is a distro dependency.
+
+    Qt's examples say ``import shared`` (also fbitem, chattutorial, ...).
+    That URI names a helper QML module compiled next to the example. Prefix
+    builds skip deploying those helpers, so the installed example still
+    contains the import and nothing in the distro provides the module.
+    Public modules are dotted (QtQuick.Controls, org.kde.kirigami) or have
+    an uppercase letter (QtQuick, SddmComponents, Charts).
+    """
+    if not name or "." in name:
+        return bool(name)
+    return any(ch.isupper() for ch in name)
 
 
 def plausible_module(name):
@@ -3937,7 +3957,7 @@ def deps_from_texts(texts, mode):
         requires.update(req)
     if mode == "provides":
         return sorted(set(provides))
-    return sorted(f"qml({mod})" for mod in requires)
+    return sorted(f"qml({mod})" for mod in requires if external_qml_module(mod))
 
 
 def read_text_file(path):
