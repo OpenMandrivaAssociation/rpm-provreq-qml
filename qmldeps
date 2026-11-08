@@ -1471,7 +1471,14 @@ def _x86_mov_rr(blob, lo, hi):
 
 
 def _x86_last_pointer(blob, base, lo, hi, reg, depth=0):
-    """Last value put in reg before hi: ('rip', va) or ('slot', rsp_disp)."""
+    """Last value put in reg before hi: ('rip', va) or ('slot', rsp_disp).
+
+    `mov r14, rcx` after `lea rcx, [rsp+slot]` is the slot. gcc parks a
+    stack URI that way so the address survives later calls. Do not discard
+    the value because a 0xe8 byte sits in between: that byte is also the
+    displacement of `movl $imm, 0xe8(%rsp)`, and `call stack_chk_fail` is
+    often the cold block between a jmp and the use.
+    """
     # The value of rsp is the stack pointer. `mov rsi, rsp` encoded with
     # opcode 8B does not match the rsp-slot scan, which only recognises 89.
     if reg == 4:
@@ -2209,15 +2216,15 @@ def _x86_struct_modules(elf, blob, base, call_off):
     QTypeRevision (uint16). Clang stores that pair as `mov reg, disp(%rsp)`
     plus `movw imm, disp+8(%rsp)`, or the same pair through a register that
     holds the struct (`lea r14, [rsp+0x70]`). The URI register was loaded
-    with `lea reg, [rip+uri]`.
+    with `lea reg, [rip+uri]` or `lea reg, [rsp+slot]`.
+
+    gcc copies that address into a callee-saved register (`lea rcx,
+    [rsp+slot]; mov r14, rcx`) and writes the literal after other calls.
+    The bytes are replayed up to this call, so the slot holds the URI even
+    though the address was taken earlier.
     """
     pad = blob.rfind(b"\xcc\xcc\xcc\xcc", max(0, call_off - 20000), call_off)
     start = pad + 4 if pad >= 0 else max(0, call_off - 20000)
-    leas = {}
-    for off, reg, target in _x86_rip_leas(blob[start:call_off], base + start):
-        leas.setdefault(reg, []).append((start + off, ("rip", target)))
-    for off, reg, slot in _x86_rsp_slots(blob, start, call_off):
-        leas.setdefault(reg, []).append((off, ("slot", slot)))
     window = max(start, call_off - 0x200)
     stores = list(_x86_reg_stores(blob, window, call_off, start))
     words = list(_x86_movw(blob, window, call_off, start))
@@ -2231,14 +2238,11 @@ def _x86_struct_modules(elf, blob, base, call_off):
             for moff, mbase, mdisp in words
         ):
             continue
-        choice = None
-        for loff, ptr in leas.get(reg, ()):
-            if loff < soff and (choice is None or loff > choice[0]):
-                choice = (loff, ptr)
-        if choice is None:
+        ptr = _x86_last_pointer(blob, base, start, soff, reg)
+        if ptr is None:
             continue
         if best is None or soff > best[0]:
-            best = (soff, choice[1])
+            best = (soff, ptr)
     if best is None:
         return set()
     kind, val = best[1]

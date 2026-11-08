@@ -1090,6 +1090,45 @@ class CppProvideTests(unittest.TestCase):
             {"org.kde.private.kcms.notifications"},
         )
 
+    def test_gcc_parks_stack_uri_in_a_callee_saved_register(self):
+        # kcm_cron on generic x86_64. gcc takes the address, copies it to
+        # r14, calls other functions, then writes the literal with overlapping
+        # movups/movaps. RegisterType::uri is r14, not the lea register.
+        raw = b"org.kde.private.kcms.cron\0"
+        text = bytearray()
+        cursor = 0x1000
+
+        def emit(blob):
+            nonlocal cursor
+            text.extend(blob)
+            cursor += len(blob)
+
+        def sse_rip(opcode, target):
+            disp = target - (cursor + 7)
+            emit(bytes([0x0F, opcode, 0x05]) + struct.pack("<i", disp))
+
+        def sse_rsp32(opcode, disp):
+            emit(bytes([0x0F, opcode, 0x84, 0x24]) + struct.pack("<i", disp))
+
+        emit(b"\x48\x8d\x8c\x24\x80\x00\x00\x00")  # lea rcx, [rsp+0x80]
+        emit(b"\x49\x89\xce")  # mov r14, rcx
+        emit(b"\xe8\x00\x00\x00\x00")  # call, rcx dies; r14 keeps the slot
+        sse_rip(0x10, 0x2000 + 10)  # movups xmm0, tail (includes the NUL)
+        sse_rsp32(0x11, 0x8A)
+        sse_rip(0x28, 0x2000)  # movaps xmm0, head
+        sse_rsp32(0x29, 0x80)
+        emit(b"\x4c\x8d\xbc\x24\xa0\x00\x00\x00")  # lea r15, [rsp+0xa0]
+        emit(b"\x4d\x89\x77\x50")  # mov [r15+0x50], r14
+        emit(b"\x66\x41\xc7\x47\x58\x00\x01")  # movw [r15+0x58], 0x100
+        emit(x86_call(cursor, 0x3000))
+        plt = x86_plt(0, 0x3000, 0x4000)
+        elf = elf_with(
+            EM_X86_64, bytes(text), raw,
+            [("_ZN11QQmlPrivate11qmlregisterENS_16RegistrationTypeEPv", 0, 0)],
+            plt,
+        )
+        self.assertEqual(qd.cpp_qml_modules(elf), {"org.kde.private.kcms.cron"})
+
     def test_stack_array_terminated_by_movb_al(self):
         # 16 bytes of payload and a separate `movb %al, slot` after xorl %eax,%eax.
         # The rodata copy is not itself a C string, so the NUL has to be replayed.
